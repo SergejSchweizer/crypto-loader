@@ -263,7 +263,7 @@ function openReviewPr(target, base, newBacklog, ids, fileCount) {
   git('commit', '-m', `docs(review): weekly repository review ${TODAY}`);
   git('push', '-u', 'origin', branch);
   const body = ['Automated weekly repository review.', '', `- Review baseline: \`${base || 'FIRST FULL REVIEW'}\``, `- Review target: \`${target}\``, `- Review engine: \`${REVIEW_ENGINE}\``, `- New backlog items: ${ids.length ? ids.map((id) => `PR-${id}`).join(', ') : 'none'}`, `- Files considered: ${fileCount}`, '', 'Implementation work remains in separate atomic PRs.'].join('\n');
-  gh('pr', 'create', '--base', BASE_BRANCH, '--head', branch, '--title', `Weekly repository review -- ${TODAY}`, '--body', body);
+  gh('pr', 'create', '--base', BASE_BRANCH, '--head', branch, '--title', `docs(review): weekly repository review ${TODAY}`, '--body', body);
 }
 
 function main() {
