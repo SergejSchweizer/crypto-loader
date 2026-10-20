@@ -866,17 +866,18 @@ class PostgresGoldSyncRepository:
         mutable_columns = tuple(name for name in column_names if name not in key_columns)
         target_projection = ", ".join(quote_identifier(name) for name in column_names)
 
-        cursor.execute(
-            f"""INSERT INTO {target_table} ({target_projection})
-            SELECT {target_projection} FROM {_SOURCE_STAGE_TABLE} AS source
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {target_table} AS target
-                WHERE target.exchange = source.exchange AND target.symbol = source.symbol
-                  AND target.timestamp_m1 = source.timestamp_m1
-            )"""
-        )
-        if cursor.rowcount != inserted:
-            raise ValueError("PostgreSQL Gold staged insert count changed during reconciliation")
+        if inserted:
+            cursor.execute(
+                f"""INSERT INTO {target_table} ({target_projection})
+                SELECT {target_projection} FROM {_SOURCE_STAGE_TABLE} AS source
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {target_table} AS target
+                    WHERE target.exchange = source.exchange AND target.symbol = source.symbol
+                      AND target.timestamp_m1 = source.timestamp_m1
+                )"""
+            )
+            if cursor.rowcount != inserted:
+                raise ValueError("PostgreSQL Gold staged insert count changed during reconciliation")
 
         if updated:
             if not mutable_columns:
@@ -898,41 +899,45 @@ class PostgresGoldSyncRepository:
             if cursor.rowcount != updated:
                 raise ValueError("PostgreSQL Gold staged update count changed during reconciliation")
 
-        cursor.execute(
-            f"""DELETE FROM {target_table} AS target
-            WHERE target.exchange = %s AND target.symbol = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
-                  WHERE source.timestamp_m1 = target.timestamp_m1
-              )""",
-            (lineage.exchange, lineage.symbol),
-        )
-        if cursor.rowcount != deleted:
-            raise ValueError("PostgreSQL Gold staged consumer-delete count changed during reconciliation")
+        if deleted:
+            cursor.execute(
+                f"""DELETE FROM {target_table} AS target
+                WHERE target.exchange = %s AND target.symbol = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
+                      WHERE source.exchange = target.exchange AND source.symbol = target.symbol
+                        AND source.timestamp_m1 = target.timestamp_m1
+                  )""",
+                (lineage.exchange, lineage.symbol),
+            )
+            if cursor.rowcount != deleted:
+                raise ValueError("PostgreSQL Gold staged consumer-delete count changed during reconciliation")
 
-        cursor.execute(
-            f"""DELETE FROM {digest_table} AS target
-            WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
-                  WHERE source.timestamp_m1 = target.timestamp_m1
-              )""",
-            _lineage_params(lineage),
-        )
-        if cursor.rowcount != deleted:
-            raise ValueError("PostgreSQL Gold staged digest-delete count changed during reconciliation")
+            cursor.execute(
+                f"""DELETE FROM {digest_table} AS target
+                WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
+                      WHERE source.exchange = target.exchange AND source.symbol = target.symbol
+                        AND source.timestamp_m1 = target.timestamp_m1
+                  )""",
+                _lineage_params(lineage),
+            )
+            if cursor.rowcount != deleted:
+                raise ValueError("PostgreSQL Gold staged digest-delete count changed during reconciliation")
 
-        cursor.execute(
-            f"""INSERT INTO {digest_table} (dataset_id, exchange, symbol, timestamp_m1, row_sha256)
-            SELECT %s, %s, %s, source.timestamp_m1, source.row_sha256
-            FROM {_SOURCE_STAGE_TABLE} AS source
-            ON CONFLICT (dataset_id, exchange, symbol, timestamp_m1) DO UPDATE
-            SET row_sha256 = EXCLUDED.row_sha256
-            WHERE {digest_table}.row_sha256 IS DISTINCT FROM EXCLUDED.row_sha256""",
-            _lineage_params(lineage),
-        )
-        if cursor.rowcount != inserted + updated:
-            raise ValueError("PostgreSQL Gold staged digest upsert count changed during reconciliation")
+        if inserted + updated:
+            cursor.execute(
+                f"""INSERT INTO {digest_table} (dataset_id, exchange, symbol, timestamp_m1, row_sha256)
+                SELECT %s, %s, %s, source.timestamp_m1, source.row_sha256
+                FROM {_SOURCE_STAGE_TABLE} AS source
+                ON CONFLICT (dataset_id, exchange, symbol, timestamp_m1) DO UPDATE
+                SET row_sha256 = EXCLUDED.row_sha256
+                WHERE {digest_table}.row_sha256 IS DISTINCT FROM EXCLUDED.row_sha256""",
+                _lineage_params(lineage),
+            )
+            if cursor.rowcount != inserted + updated:
+                raise ValueError("PostgreSQL Gold staged digest upsert count changed during reconciliation")
 
     @staticmethod
     def _verify_stage_digests(cursor: CursorPort, lineage: GoldLineage, expected_count: int) -> None:
@@ -948,7 +953,8 @@ class PostgresGoldSyncRepository:
                 +
                 (SELECT COUNT(*) FROM {digest_table} AS target
                  LEFT JOIN {_SOURCE_STAGE_TABLE} AS source
-                   ON source.timestamp_m1 = target.timestamp_m1
+                   ON source.exchange = target.exchange AND source.symbol = target.symbol
+                  AND source.timestamp_m1 = target.timestamp_m1
                  WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
                    AND source.timestamp_m1 IS NULL)""",
             (*_lineage_params(lineage), *_lineage_params(lineage)),
@@ -1014,6 +1020,7 @@ class PostgresGoldSyncRepository:
                 cursor.execute(f"CREATE UNIQUE INDEX ON {_SOURCE_STAGE_TABLE} (exchange, symbol, timestamp_m1)")
                 column_names = tuple(column.name for column in consumer_table.columns)
                 self._stage_source_rows(cursor, source_rows, column_names, expected_count=snapshot.row_count)
+                cursor.execute(f"ANALYZE {_SOURCE_STAGE_TABLE}")
 
                 stage = "delta planning"
                 counts = self._stage_difference_counts(cursor, lineage)
