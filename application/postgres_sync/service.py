@@ -31,11 +31,12 @@ from application.postgres_sync.schema import PostgresTableSchema, build_postgres
 
 Clock = Callable[[], datetime]
 _MAX_PARALLEL_LINEAGES = 2
-# Wide feature rows and Python payload objects can expand far beyond Parquet size.
+# Streaming keeps the source working set bounded, regardless of total lineage size.
 _PARALLEL_MEMORY_BUDGET_BYTES = 2 * 1024**3
+_STREAM_WORKER_BASE_MEMORY_BYTES = 768 * 1024**2
 _ESTIMATED_BYTES_PER_CELL = 128
 _PARQUET_EXPANSION_FACTOR = 16
-_PARQUET_BATCH_ROWS = 8_192
+_PARQUET_BATCH_ROWS = 2_048
 
 
 class GoldSyncServiceError(RuntimeError):
@@ -157,9 +158,10 @@ def _estimated_source_memory(snapshot: GoldSourceSnapshot) -> int:
         parquet_size = snapshot.artifact_path.stat().st_size
     except Exception:
         return _PARALLEL_MEMORY_BUDGET_BYTES + 1
-    row_estimate = snapshot.row_count * column_count * _ESTIMATED_BYTES_PER_CELL
-    parquet_estimate = parquet_size * _PARQUET_EXPANSION_FACTOR
-    return max(row_estimate, parquet_estimate)
+    batch_rows = min(max(snapshot.row_count, 1), _PARQUET_BATCH_ROWS)
+    row_batch_estimate = batch_rows * column_count * _ESTIMATED_BYTES_PER_CELL
+    parquet_batch_estimate = parquet_size * _PARQUET_EXPANSION_FACTOR * batch_rows // max(snapshot.row_count, 1)
+    return _STREAM_WORKER_BASE_MEMORY_BYTES + max(row_batch_estimate, parquet_batch_estimate)
 
 
 def _reconcile_one_snapshot(
@@ -232,18 +234,25 @@ def reconcile_snapshots(
     ordered = sorted(snapshots, key=lambda item: item.lineage)
     batches: list[tuple[GoldSourceSnapshot, ...]] = []
     parallel_batch: list[GoldSourceSnapshot] = []
+    parallel_batch_memory = 0
 
     def flush_parallel_batch() -> None:
+        nonlocal parallel_batch_memory
         if parallel_batch:
             batches.append(tuple(parallel_batch))
             parallel_batch.clear()
+            parallel_batch_memory = 0
 
     for snapshot in ordered:
-        if max_parallel_lineages == 1 or _estimated_source_memory(snapshot) > _PARALLEL_MEMORY_BUDGET_BYTES:
+        estimated_memory = _estimated_source_memory(snapshot)
+        if max_parallel_lineages == 1 or estimated_memory > _PARALLEL_MEMORY_BUDGET_BYTES:
             flush_parallel_batch()
             batches.append((snapshot,))
             continue
+        if parallel_batch and parallel_batch_memory + estimated_memory > _PARALLEL_MEMORY_BUDGET_BYTES:
+            flush_parallel_batch()
         parallel_batch.append(snapshot)
+        parallel_batch_memory += estimated_memory
         if len(parallel_batch) == max_parallel_lineages:
             flush_parallel_batch()
     flush_parallel_batch()

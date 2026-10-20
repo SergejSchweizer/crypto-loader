@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -297,7 +298,7 @@ def test_processing_is_stable_and_stops_on_first_failure(tmp_path: Path) -> None
     assert sol.lineage not in repository.states
 
 
-def test_small_lineages_reconcile_in_parallel_but_large_lineage_is_exclusive(
+def test_small_lineages_reconcile_in_parallel_but_over_budget_lineage_is_exclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,6 +349,102 @@ def test_small_lineages_reconcile_in_parallel_but_large_lineage_is_exclusive(
 
     assert [item.lineage.symbol for item in result.lineages] == ["BTC", "ETH", "SOL"]
     assert repository.max_active == 2
+
+
+def test_stream_memory_estimate_is_independent_of_total_lineage_rows(tmp_path: Path) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshot = _write_snapshot(tmp_path, rows=((timestamp, 1.0),))
+    large_snapshot = replace(snapshot, row_count=4_000_000)
+    larger_snapshot = replace(snapshot, row_count=100_000_000)
+
+    large_estimate = postgres_sync_service._estimated_source_memory(large_snapshot)
+    assert large_estimate == postgres_sync_service._estimated_source_memory(larger_snapshot)
+    assert large_estimate < postgres_sync_service._PARALLEL_MEMORY_BUDGET_BYTES
+
+
+def test_large_streamed_lineages_reconcile_in_parallel(tmp_path: Path) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshots = tuple(
+        replace(
+            _write_snapshot(tmp_path, symbol=symbol, rows=((timestamp, float(index + 1)),)),
+            row_count=4_000_000,
+        )
+        for index, symbol in enumerate(("BTC", "ETH"))
+    )
+    both_workers = threading.Barrier(2, timeout=3)
+
+    class TrackingStreamingRepository:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def reconcile_lineage_stream(
+            self,
+            source: GoldSourceSnapshot,
+            ddl: str,
+            schema_signature: str,
+            source_rows: Iterable[Mapping[str, object]],
+            next_state: GoldSyncState,
+        ) -> GoldSyncLineageResult:
+            assert source_rows.__class__.__name__ == "generator"
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                both_workers.wait()
+                return GoldSyncLineageResult(source.lineage, source.source_fingerprint, 0, 0, 0, 0, "unchanged")
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    repository = TrackingStreamingRepository()
+    result = reconcile_snapshots(snapshots, repository, clock=_fixed_clock)
+
+    assert len(result.lineages) == 2
+    assert repository.max_active == 2
+
+
+def test_parallel_workers_share_one_global_memory_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshots = tuple(
+        _write_snapshot(tmp_path, symbol=symbol, rows=((timestamp, float(index + 1)),))
+        for index, symbol in enumerate(("BTC", "ETH"))
+    )
+    per_lineage_reservation = int(postgres_sync_service._PARALLEL_MEMORY_BUDGET_BYTES * 0.6)
+    monkeypatch.setattr(postgres_sync_service, "_estimated_source_memory", lambda _: per_lineage_reservation)
+
+    class TrackingRepository(FakeRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def reconcile_lineage(
+            self,
+            snapshot: GoldSourceSnapshot,
+            ddl: str,
+            schema_signature: str,
+            planner: GoldReconcilePlanner,
+        ) -> GoldReconcileDecision:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.02)
+                return super().reconcile_lineage(snapshot, ddl, schema_signature, planner)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    repository = TrackingRepository()
+    reconcile_snapshots(snapshots, repository, clock=_fixed_clock)
+
+    assert repository.max_active == 1
 
 
 def test_parallel_lineage_limit_must_be_one_or_two(tmp_path: Path) -> None:

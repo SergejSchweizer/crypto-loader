@@ -523,6 +523,12 @@ def test_stream_reconcile_stages_source_and_applies_set_based_delta_atomically()
     queries = [query for query, _ in connection.trace]
     assert any(query.startswith("CREATE TEMP TABLE") for query in queries)
     assert any(query.startswith("EXECUTEMANY INSERT INTO pg_temp.") for query in queries)
+    stage_index = next(
+        index for index, query in enumerate(queries) if query.startswith("EXECUTEMANY INSERT INTO pg_temp.")
+    )
+    analyze_index = queries.index('ANALYZE pg_temp."gold_sync_stage"')
+    delta_index = next(index for index, query in enumerate(queries) if "COUNT(*) FILTER" in query)
+    assert stage_index < analyze_index < delta_index
     staged_params = next(params for query, params in connection.trace if query.startswith("EXECUTEMANY"))
     assert staged_params[0][-1] == new_hash  # type: ignore[index]
     assert any(query.startswith('INSERT INTO "crypto_loader".') and "SELECT" in query for query in queries)
@@ -530,6 +536,21 @@ def test_stream_reconcile_stages_source_and_applies_set_based_delta_atomically()
     assert any(query.startswith('UPDATE "crypto_loader".') for query in queries) is False
     assert ("COMMIT", None) in connection.trace
     assert ("ROLLBACK", None) not in connection.trace
+
+
+def test_zero_delta_skips_consumer_and_digest_writes() -> None:
+    schema = _schema()
+    consumer_table = next(table for table in bootstrap_migration(schema).tables if table.schema_name == "crypto_loader")
+    connection = FakeConnection()
+
+    PostgresGoldSyncRepository._apply_staged_delta(
+        connection.cursor(),
+        _snapshot(schema.signature).lineage,
+        consumer_table,
+        (0, 0, 0),
+    )
+
+    assert not any(query.startswith(("INSERT", "UPDATE", "DELETE")) for query, _ in connection.trace)
 
 
 def test_source_staging_flushes_bounded_batches(monkeypatch: pytest.MonkeyPatch) -> None:
