@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import psycopg
 import pytest
 
+import infra.postgres.gold_repository as gold_repository
 from application.postgres_sync import (
     GoldDeltaPlan,
     GoldLineage,
@@ -22,9 +24,11 @@ from application.postgres_sync.delta import canonical_row_hash
 from application.postgres_sync.schema import PostgresCatalogTable, bootstrap_migration, build_postgres_table_schema
 from infra.postgres.gold_repository import (
     PostgresConnectionSettings,
+    PostgresGoldRepositoryError,
     PostgresGoldSyncRepository,
     PostgresSchemaMismatchError,
     _as_datetime,
+    _safe_database_error_code,
 )
 
 
@@ -40,9 +44,21 @@ class FakeCursor:
         self.fetchone_queue = fetchone_queue
         self.fail_token = fail_token
         self.rowcount = rowcount
+        self.fetchmany_rows: list[tuple[object, ...]] | None = None
 
     def execute(self, query: str, params: object = None) -> object:
         self.trace.append((query, params))
+        if isinstance(params, tuple) and query.count("%s") != len(params):
+            raise AssertionError(f"SQL placeholder count mismatch: {query.count('%s')} != {len(params)}")
+        if self.fail_token is not None and self.fail_token in query:
+            raise RuntimeError("injected SQL failure")
+        return None
+
+    def executemany(self, query: str, params_seq: object) -> object:
+        params = list(params_seq)  # type: ignore[arg-type]
+        self.trace.append((f"EXECUTEMANY {query}", params))
+        if any(len(row) != query.count("%s") for row in params):
+            raise AssertionError("SQL placeholder count does not match a staged row")
         if self.fail_token is not None and self.fail_token in query:
             raise RuntimeError("injected SQL failure")
         return None
@@ -58,6 +74,17 @@ class FakeCursor:
             return []
         value = self.fetchone_queue.pop(0)
         return [tuple(row) for row in value]  # type: ignore[union-attr]
+
+    def fetchmany(self, size: int = 1) -> list[tuple[object, ...]]:
+        self.trace.append(("FETCHMANY", size))
+        if self.fetchmany_rows is None:
+            if not self.fetchone_queue:
+                return []
+            value = self.fetchone_queue.pop(0)
+            self.fetchmany_rows = [tuple(row) for row in value]  # type: ignore[union-attr]
+        rows = self.fetchmany_rows[:size]
+        self.fetchmany_rows = self.fetchmany_rows[size:]
+        return rows
 
     def close(self) -> None:
         return None
@@ -75,7 +102,8 @@ class FakeConnection:
         self.fail_token = fail_token
         self.rowcount = rowcount
 
-    def cursor(self) -> FakeCursor:
+    def cursor(self, name: str | None = None) -> FakeCursor:
+        self.trace.append(("CURSOR", name))
         return FakeCursor(self.trace, self.fetchone_queue, self.fail_token, self.rowcount)
 
     def commit(self) -> None:
@@ -154,6 +182,59 @@ def test_settings_exact_endpoint_and_secret_redaction() -> None:
         PostgresConnectionSettings("localhost", 54321, "crypto-loader", "db", "secret")
     with pytest.raises(ValueError, match="timeout"):
         PostgresConnectionSettings("10.10.1.3", 54321, "crypto-loader", "db", "secret", lock_timeout_ms=0)
+
+
+def test_safe_database_error_code_includes_sqlstate_without_database_message() -> None:
+    error = RuntimeError("sensitive query detail")
+    error.sqlstate = "57014"  # type: ignore[attr-defined]
+
+    detail = _safe_database_error_code(error)
+
+    assert detail == "RuntimeError (SQLSTATE 57014)"
+    assert "sensitive query detail" not in detail
+
+
+def test_safe_operational_error_redacts_password() -> None:
+    error = psycopg.OperationalError("password=secret-value connection reset by peer")
+
+    detail = _safe_database_error_code(error, password="secret-value")
+
+    assert "connection reset by peer" in detail
+    assert "secret-value" not in detail
+
+
+def test_open_failure_reports_stage_and_closes_connection() -> None:
+    connection = FakeConnection(fail_token="statement_timeout")
+    repository = PostgresGoldSyncRepository(_settings(), connection_factory=lambda _: connection)
+
+    with pytest.raises(PostgresGoldRepositoryError) as exc_info:
+        repository._open()
+
+    assert exc_info.value.safe_detail == "set statement timeout: RuntimeError"
+    assert ("CLOSE", None) in connection.trace
+
+
+def test_consumer_digests_are_read_in_bounded_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _schema()
+    consumer_table = next(table for table in bootstrap_migration(schema).tables if table.schema_name == "crypto_loader")
+    lineage = GoldLineage("gold.history.full.m1", "deribit", "BTC")
+    first = datetime(2026, 1, 1, tzinfo=UTC)
+    second = datetime(2026, 1, 2, tzinfo=UTC)
+    rows = [
+        ("deribit", "BTC", first, 1.0),
+        ("deribit", "BTC", second, 2.0),
+    ]
+    connection = FakeConnection(fetchone_queue=[rows])
+    monkeypatch.setattr(gold_repository, "_CONSUMER_FETCH_BATCH_SIZE", 1)
+
+    digests = tuple(PostgresGoldSyncRepository._iter_consumer_digests(connection, lineage, consumer_table))
+
+    assert tuple(digest.key.timestamp_m1 for digest in digests) == (first, second)
+    assert [item for item in connection.trace if item[0] == "FETCHMANY"] == [
+        ("FETCHMANY", 1),
+        ("FETCHMANY", 1),
+        ("FETCHMANY", 1),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -347,6 +428,165 @@ def test_reconcile_lineage_locks_before_reads_and_commits_after_checkpoint() -> 
     commit_idx = queries.index("COMMIT")
     assert lock_idx < state_read_idx < digest_read_idx < planner_idx
     assert planner_idx < mutation_idx < checkpoint_idx < final_consumer_read_idx < commit_idx
+
+
+def test_stream_reconcile_stages_source_and_applies_set_based_delta_atomically() -> None:
+    schema = _schema()
+    column_rows, primary_key_rows = _catalog_rows(bootstrap_migration(schema).tables)
+    snapshot = _snapshot(schema.signature)
+    new_timestamp = snapshot.min_timestamp
+    assert new_timestamp is not None
+    old_timestamp = datetime(2025, 12, 31, tzinfo=UTC)
+    new_row = {
+        "exchange": "deribit",
+        "symbol": "BTC",
+        "timestamp_m1": new_timestamp,
+        "value": 1.0,
+    }
+    new_hash = canonical_row_hash(new_row)
+    old_state = GoldSyncState(
+        snapshot.lineage,
+        "previous-fingerprint",
+        schema.signature,
+        1,
+        old_timestamp,
+        old_timestamp,
+        old_timestamp,
+        "v1.0.0",
+    )
+    next_state = GoldSyncState(
+        snapshot.lineage,
+        snapshot.source_fingerprint,
+        schema.signature,
+        1,
+        new_timestamp,
+        new_timestamp,
+        datetime(2026, 1, 2, tzinfo=UTC),
+        snapshot.source_version,
+        snapshot.build_id,
+    )
+    old_state_row = (
+        old_state.lineage.dataset_id,
+        old_state.lineage.exchange,
+        old_state.lineage.symbol,
+        old_state.source_fingerprint,
+        old_state.schema_signature,
+        old_state.row_count,
+        old_state.min_timestamp,
+        old_state.max_timestamp,
+        old_state.synced_at_utc,
+        old_state.source_version,
+        old_state.build_id,
+    )
+    next_state_row = (
+        next_state.lineage.dataset_id,
+        next_state.lineage.exchange,
+        next_state.lineage.symbol,
+        next_state.source_fingerprint,
+        next_state.schema_signature,
+        next_state.row_count,
+        next_state.min_timestamp,
+        next_state.max_timestamp,
+        next_state.synced_at_utc,
+        next_state.source_version,
+        next_state.build_id,
+    )
+    connection = FakeConnection(
+        fetchone_queue=[
+            column_rows,
+            primary_key_rows,
+            old_state_row,
+            (1, old_timestamp, old_timestamp),
+            (0,),
+            (1, 0),
+            (1,),
+            (0,),
+            (0,),
+            (1,),
+            (0,),
+            next_state_row,
+            (1, new_timestamp, new_timestamp),
+        ]
+    )
+    repository = PostgresGoldSyncRepository(_settings(), connection_factory=lambda _: connection)
+
+    result = repository.reconcile_lineage_stream(
+        snapshot,
+        schema.ddl,
+        schema.signature,
+        [new_row],
+        next_state,
+    )
+
+    assert (result.inserted, result.updated, result.deleted, result.unchanged) == (1, 0, 1, 0)
+    assert result.status == "synchronized"
+    queries = [query for query, _ in connection.trace]
+    assert any(query.startswith("CREATE TEMP TABLE") for query in queries)
+    assert any(query.startswith("EXECUTEMANY INSERT INTO pg_temp.") for query in queries)
+    staged_params = next(params for query, params in connection.trace if query.startswith("EXECUTEMANY"))
+    assert staged_params[0][-1] == new_hash  # type: ignore[index]
+    assert any(query.startswith('INSERT INTO "crypto_loader".') and "SELECT" in query for query in queries)
+    assert any(query.startswith('DELETE FROM "crypto_loader".') for query in queries)
+    assert any(query.startswith('UPDATE "crypto_loader".') for query in queries) is False
+    assert ("COMMIT", None) in connection.trace
+    assert ("ROLLBACK", None) not in connection.trace
+
+
+def test_source_staging_flushes_bounded_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gold_repository, "_SOURCE_STAGE_BATCH_SIZE", 2)
+    connection = FakeConnection()
+    cursor = connection.cursor()
+    rows = [
+        {"exchange": "deribit", "symbol": "BTC", "timestamp_m1": datetime(2026, 1, day, tzinfo=UTC), "value": day}
+        for day in range(1, 6)
+    ]
+
+    PostgresGoldSyncRepository._stage_source_rows(
+        cursor,
+        rows,
+        ("exchange", "symbol", "timestamp_m1", "value"),
+        expected_count=5,
+    )
+
+    batches = [params for query, params in connection.trace if query.startswith("EXECUTEMANY")]
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert all(len(row) == 5 for batch in batches for row in batch)
+
+
+def test_stream_reconcile_rolls_back_if_staging_fails() -> None:
+    schema = _schema()
+    column_rows, primary_key_rows = _catalog_rows(bootstrap_migration(schema).tables)
+    snapshot = _snapshot(schema.signature)
+    timestamp = snapshot.min_timestamp
+    assert timestamp is not None
+    state = GoldSyncState(
+        snapshot.lineage,
+        "fingerprint",
+        schema.signature,
+        1,
+        timestamp,
+        timestamp,
+        timestamp,
+        snapshot.source_version,
+        snapshot.build_id,
+    )
+    connection = FakeConnection(
+        fetchone_queue=[column_rows, primary_key_rows, None, (0, None, None), (0,)],
+        fail_token="INSERT INTO pg_temp.",
+    )
+    repository = PostgresGoldSyncRepository(_settings(), connection_factory=lambda _: connection)
+
+    with pytest.raises(PostgresGoldRepositoryError, match="transaction failed"):
+        repository.reconcile_lineage_stream(
+            snapshot,
+            schema.ddl,
+            schema.signature,
+            [{"exchange": "deribit", "symbol": "BTC", "timestamp_m1": timestamp, "value": 1.0}],
+            state,
+        )
+
+    assert ("ROLLBACK", None) in connection.trace
+    assert ("COMMIT", None) not in connection.trace
 
 
 def test_reconcile_lineage_rolls_back_mutations_when_checkpoint_fails() -> None:

@@ -70,9 +70,14 @@ def run_gold_sync_postgres(args: argparse.Namespace, logger: logging.Logger) -> 
                 Path(str(args.gold_root)),
                 repository,
                 publication_result=Path(str(publication_result)),
+                max_parallel_lineages=config.max_parallel_lineages,
             )
         else:
-            result = synchronize_gold_root(Path(str(args.gold_root)), repository)
+            result = synchronize_gold_root(
+                Path(str(args.gold_root)),
+                repository,
+                max_parallel_lineages=config.max_parallel_lineages,
+            )
     except PostgresSchemaMismatchError as exc:
         raise PostgresSyncCommandError("compatibility-schema", str(exc)) from None
     except GoldSyncServiceError as exc:

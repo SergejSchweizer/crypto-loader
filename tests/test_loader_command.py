@@ -39,6 +39,8 @@ def _empty_fetch_result(
 
 
 def test_run_bronze_build_emits_manifest_and_plot_file_lists(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+
     class _NoopLock:
         def __init__(self, lock_path: str) -> None:
             del lock_path
@@ -130,6 +132,7 @@ def test_run_bronze_build_persists_trade_chunks_incrementally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bronze trade fetches should persist chunks for both perp and option datasets."""
+    monkeypatch.chdir(tmp_path)
 
     class _NoopLock:
         def __init__(self, lock_path: str) -> None:

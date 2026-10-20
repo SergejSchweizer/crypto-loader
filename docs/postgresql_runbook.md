@@ -25,10 +25,20 @@ schemas.
 ## Runtime timeouts
 
 `gold-sync-postgres` requires positive bounded timeout settings. The defaults are
-`PGCONNECT_TIMEOUT_S=10`, `PGLOCK_TIMEOUT_MS=5000`, `PGSTATEMENT_TIMEOUT_MS=30000`,
-and `PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS=60000`. The connection timeout is
+`PGCONNECT_TIMEOUT_S=10`, `PGLOCK_TIMEOUT_MS=5000`, `PGSTATEMENT_TIMEOUT_MS=3600000`,
+and `PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS=3600000`. The connection timeout is
 applied before connecting; the remaining settings are applied in the UTC session
 before catalog reads or DML. Invalid or non-positive values fail configuration.
+
+## Parallelism and memory
+
+Independent Gold lineages are reconciled with at most two workers by default.
+Set `PGSYNC_MAX_WORKERS=1` to force serial execution; values above `2` are rejected.
+To cap peak memory, a lineage with an estimated source working set above 2 GiB is
+always processed alone. The estimate uses Parquet size and row/column counts. Source
+Parquet is read in streaming batches, and delta planning uses sorted merge scans
+instead of full-size key dictionaries. Each lineage remains its own atomic
+transaction; after a failure, rerunning safely resumes from committed checkpoints.
 
 ## Administrator bootstrap
 

@@ -109,12 +109,22 @@ def _snapshot_from_candidate(manifest_path: Path, payload: dict[str, object]) ->
     schema_signature = _schema_signature(schema)
     if payload.get("schema_signature") != schema_signature:
         raise ValueError("Gold manifest schema signature does not match Parquet schema")
-    frame = pl.read_parquet(parquet_path)
-    actual_lineage = frame.select("exchange", "symbol").unique().rows()
-    if actual_lineage != [(lineage.exchange, lineage.symbol)]:
+    summary = (
+        pl.scan_parquet(parquet_path)
+        .select(
+            pl.len().alias("row_count"),
+            (pl.col("exchange").is_null() | (pl.col("exchange") != lineage.exchange)).any().alias("wrong_exchange"),
+            (pl.col("symbol").is_null() | (pl.col("symbol") != lineage.symbol)).any().alias("wrong_symbol"),
+            pl.col("timestamp_m1").min().alias("min_timestamp"),
+            pl.col("timestamp_m1").max().alias("max_timestamp"),
+        )
+        .collect(engine="streaming")
+        .row(0, named=True)
+    )
+    if summary["wrong_exchange"] or summary["wrong_symbol"]:
         raise ValueError("Gold manifest lineage does not match Parquet rows")
     row_count = _manifest_row_count(payload)
-    if frame.height != row_count:
+    if summary["row_count"] != row_count:
         raise ValueError("Gold manifest row count does not match Parquet rows")
     min_timestamp = _parse_utc_timestamp(payload.get("min_timestamp"), "min_timestamp")
     max_timestamp = _parse_utc_timestamp(payload.get("max_timestamp"), "max_timestamp")
@@ -122,11 +132,7 @@ def _snapshot_from_candidate(manifest_path: Path, payload: dict[str, object]) ->
         min_timestamp = None
         max_timestamp = None
     else:
-        actual_bounds = frame.select(
-            pl.col("timestamp_m1").min().alias("min_timestamp"),
-            pl.col("timestamp_m1").max().alias("max_timestamp"),
-        ).row(0, named=True)
-        if actual_bounds["min_timestamp"] != min_timestamp or actual_bounds["max_timestamp"] != max_timestamp:
+        if summary["min_timestamp"] != min_timestamp or summary["max_timestamp"] != max_timestamp:
             raise ValueError("Gold manifest timestamp bounds do not match Parquet rows")
     version = _manifest_version(payload)
     build_id_raw = payload.get("build_id")

@@ -7,13 +7,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_import_linter_contracts_pass() -> None:
     """Validate import-linter contracts for package layering."""
 
     executable = Path(sys.executable).parent / "lint-imports"
     process = subprocess.run(
-        [str(executable), "--config", ".importlinter"],
+        [sys.executable, str(executable), "--no-cache", "--config", str(REPO_ROOT / ".importlinter")],
+        cwd=REPO_ROOT,
         check=False,
         capture_output=True,
         text=True,
@@ -25,7 +28,7 @@ def test_import_linter_includes_acyclic_root_package_contract() -> None:
     """Root packages should remain guarded against circular sibling dependencies."""
 
     config = configparser.ConfigParser()
-    config.read(".importlinter")
+    config.read(REPO_ROOT / ".importlinter")
 
     section = "importlinter:contract:acyclic_root_packages"
     assert section in config
@@ -37,7 +40,7 @@ def test_api_does_not_import_lake_adapter_directly() -> None:
     """API modules should reach lake persistence through application-facing services."""
 
     config = configparser.ConfigParser()
-    config.read(".importlinter")
+    config.read(REPO_ROOT / ".importlinter")
 
     section = "importlinter:contract:no_api_to_lake_persistence_internals"
     assert section in config

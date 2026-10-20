@@ -18,6 +18,15 @@ from typing import Any
 from application.services.medallion_freshness import audit_gold_history_freshness
 from application.services.runtime_service import LOG_ARCHIVE_RETENTION_DAYS, enforce_log_retention
 
+_POSTGRES_ENV_KEYS = ("PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD")
+_POSTGRES_CONFIG_ALIASES = {
+    "host": "PGHOST",
+    "port": "PGPORT",
+    "user": "PGUSER",
+    "database": "PGDATABASE",
+    "password": "PGPASSWORD",
+}
+
 
 @dataclass(frozen=True)
 class PipelineStep:
@@ -70,15 +79,39 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return loaded
 
 
-def _apply_env_from_config(config_data: dict[str, Any]) -> None:
-    """Export configured runtime values to every child CLI process."""
+def _apply_env_from_config(
+    config_data: dict[str, Any],
+    *,
+    fallback_config_path: Path | None = None,
+) -> None:
+    """Export configured runtime values, using protected config.yaml for missing PG values."""
 
     env_config = config_data.get("env")
-    if not isinstance(env_config, dict):
+    if isinstance(env_config, dict):
+        for raw_key, value in env_config.items():
+            if value is not None:
+                os.environ[str(raw_key)] = str(value)
+
+    if fallback_config_path is None or not fallback_config_path.is_file():
         return
-    for raw_key, value in env_config.items():
-        if value is not None:
-            os.environ[str(raw_key)] = str(value)
+
+    fallback_config = _load_yaml(fallback_config_path)
+    fallback_env = fallback_config.get("env")
+    postgres_values = {
+        key: str(fallback_env[key])
+        for key in _POSTGRES_ENV_KEYS
+        if isinstance(fallback_env, dict) and fallback_env.get(key) is not None and str(fallback_env[key]).strip()
+    }
+    postgres_config = fallback_config.get("postgres-sync")
+    if isinstance(postgres_config, dict):
+        for raw_key, env_key in _POSTGRES_CONFIG_ALIASES.items():
+            value = postgres_config.get(raw_key)
+            if env_key not in postgres_values and value is not None and str(value).strip():
+                postgres_values[env_key] = str(value)
+
+    for key, value in postgres_values.items():
+        if not os.environ.get(key, "").strip():
+            os.environ[key] = value
 
 
 def _build_steps(
@@ -483,7 +516,7 @@ def main() -> int:
         return 2
 
     config_data = _load_yaml(config_path)
-    _apply_env_from_config(config_data)
+    _apply_env_from_config(config_data, fallback_config_path=main_path.parent / "config.yaml")
     steps = _build_steps(main_path=main_path, config_path=config_path, config_data=config_data)
     if getattr(args, "dry_run", False):
         bronze_step = next((step for step in steps if step.name == "bronze"), None)

@@ -22,6 +22,9 @@ def test_runtime_only_configuration() -> None:
     assert config.user == "crypto-loader"
     assert config.database == "market_data"
     assert config.as_env() == {key: str(value) for key, value in _runtime().items()}
+    assert config.statement_timeout_ms == 3_600_000
+    assert config.idle_in_transaction_session_timeout_ms == 3_600_000
+    assert config.max_parallel_lineages == 2
     assert "fake-runtime-secret" not in repr(config)
     assert config.safe_dict()["password"] == "<redacted>"
 
@@ -75,6 +78,18 @@ def test_timeout_configuration_defaults_and_overrides() -> None:
         config.statement_timeout_ms,
         config.idle_in_transaction_session_timeout_ms,
     ) == (7, 800, 900, 1000)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", 1), ("2", 2)])
+def test_parallel_lineage_worker_configuration(value: str, expected: int) -> None:
+    config = PostgresSyncConfig.from_sources(environment={"PGSYNC_MAX_WORKERS": value}, runtime_values=_runtime())
+    assert config.max_parallel_lineages == expected
+
+
+@pytest.mark.parametrize("value", ["0", "3", "bad"])
+def test_parallel_lineage_worker_configuration_is_bounded(value: str) -> None:
+    with pytest.raises(ValueError, match="PGSYNC_MAX_WORKERS"):
+        PostgresSyncConfig.from_sources(environment={"PGSYNC_MAX_WORKERS": value}, runtime_values=_runtime())
 
 
 @pytest.mark.parametrize("key", ["PGCONNECT_TIMEOUT_S", "PGLOCK_TIMEOUT_MS", "PGSTATEMENT_TIMEOUT_MS"])

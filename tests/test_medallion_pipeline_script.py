@@ -422,6 +422,37 @@ def test_apply_env_from_config_exports_postgres_runtime_values(monkeypatch: pyte
     assert module.os.environ["PGPASSWORD"] == "local-only"
 
 
+def test_apply_env_from_config_falls_back_to_protected_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    fallback_config = tmp_path / "config.yaml"
+    fallback_config.write_text(
+        "env:\n"
+        "  PGHOST: 10.10.1.3\n"
+        "  PGPORT: 54321\n"
+        "  PGUSER: crypto-loader\n"
+        "  PGDATABASE: postgres\n"
+        "  PGPASSWORD: protected-secret\n",
+        encoding="utf-8",
+    )
+    for key in ("PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PGUSER", "shell-user")
+
+    module._apply_env_from_config(
+        {"env": {"DEPTH_SYNC_LOG_DIR": ".logs"}},
+        fallback_config_path=fallback_config,
+    )
+
+    assert module.os.environ["PGHOST"] == "10.10.1.3"
+    assert module.os.environ["PGPORT"] == "54321"
+    assert module.os.environ["PGUSER"] == "shell-user"
+    assert module.os.environ["PGDATABASE"] == "postgres"
+    assert module.os.environ["PGPASSWORD"] == "protected-secret"
+
+
 def test_lock_acquire_and_release(tmp_path: Path) -> None:
     module = _load_pipeline_module()
     lock_file = tmp_path / "lock" / "x.lock"

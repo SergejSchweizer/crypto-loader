@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import Final
 
 from application.postgres_sync.contracts import (
@@ -40,13 +41,17 @@ def _canonical_value(value: object) -> bytes:
     if isinstance(value, int):
         return f"int:{value}".encode("ascii")
     if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("non-finite floating-point values cannot be hashed deterministically")
+        if math.isnan(value):
+            return b"float:nan"
+        if math.isinf(value):
+            return b"float:-inf" if value < 0 else b"float:+inf"
         normalized = 0.0 if value == 0.0 else value
         return f"float:{format(normalized, '.17g')}".encode("ascii")
     if isinstance(value, Decimal):
-        if not value.is_finite():
-            raise ValueError("non-finite decimal values cannot be hashed deterministically")
+        if value.is_nan():
+            return b"decimal:nan"
+        if value.is_infinite():
+            return b"decimal:-inf" if value.is_signed() else b"decimal:+inf"
         return f"decimal:{value.normalize()}".encode("ascii")
     if isinstance(value, datetime):
         return _utc_datetime_bytes(value)
@@ -82,27 +87,23 @@ def canonical_row_hash(row: Mapping[str, object]) -> str:
 
 
 def build_source_digests(
-    rows: Sequence[Mapping[str, object]],
+    rows: Iterable[Mapping[str, object]],
 ) -> tuple[tuple[GoldRowPayload, GoldRowDigest], ...]:
     """Create deterministic payload/digest pairs and reject duplicate logical keys."""
 
-    by_key: dict[GoldRowKey, tuple[GoldRowPayload, GoldRowDigest]] = {}
+    result: list[tuple[GoldRowPayload, GoldRowDigest]] = []
     for row in rows:
         payload = payload_from_mapping(row)
-        if payload.key in by_key:
-            raise ValueError(f"duplicate source Gold key: {payload.key}")
         digest = GoldRowDigest(payload.key, canonical_row_hash(row))
-        by_key[payload.key] = (payload, digest)
-    return tuple(by_key[key] for key in sorted(by_key))
+        result.append((payload, digest))
 
-
-def _target_digest_map(target_digests: Sequence[GoldRowDigest]) -> dict[GoldRowKey, GoldRowDigest]:
-    result: dict[GoldRowKey, GoldRowDigest] = {}
-    for digest in target_digests:
-        if digest.key in result:
-            raise ValueError(f"duplicate PostgreSQL digest key: {digest.key}")
-        result[digest.key] = digest
-    return result
+    result.sort(key=lambda pair: pair[0].key)
+    previous_key: GoldRowKey | None = None
+    for payload, _ in result:
+        if payload.key == previous_key:
+            raise ValueError(f"duplicate source Gold key: {payload.key}")
+        previous_key = payload.key
+    return tuple(result)
 
 
 def plan_gold_delta(
@@ -117,32 +118,73 @@ def plan_gold_delta(
         raise ValueError("Gold digest state exists without an authoritative sync checkpoint")
 
     source_pairs = build_source_digests(source_rows)
-    source_by_key = {payload.key: (payload, digest) for payload, digest in source_pairs}
-    target_by_key = _target_digest_map(target_digests)
+    return plan_gold_delta_from_source_pairs(source_pairs, target_digests, state_exists=state_exists)
+
+
+def plan_gold_delta_from_source_pairs(
+    source_pairs: Sequence[tuple[GoldRowPayload, GoldRowDigest]],
+    target_digests: Sequence[GoldRowDigest],
+    *,
+    state_exists: bool,
+) -> GoldDeltaPlan:
+    """Compare precomputed source payload digests with PostgreSQL's current digest state."""
+
+    if not state_exists and target_digests:
+        raise ValueError("Gold digest state exists without an authoritative sync checkpoint")
+
+    source_is_ordered = all(left[0].key < right[0].key for left, right in pairwise(source_pairs))
+    target_is_ordered = all(left.key < right.key for left, right in pairwise(target_digests))
+    ordered_source = source_pairs if source_is_ordered else sorted(source_pairs, key=lambda pair: pair[0].key)
+    ordered_target = target_digests if target_is_ordered else sorted(target_digests, key=lambda digest: digest.key)
+    for payload, digest in ordered_source:
+        if payload.key != digest.key:
+            raise ValueError("source payload and digest keys differ")
+    for source_before, source_after in pairwise(ordered_source):
+        if source_before[0].key == source_after[0].key:
+            raise ValueError("duplicate source Gold key")
+    for target_before, target_after in pairwise(ordered_target):
+        if target_before.key == target_after.key:
+            raise ValueError("duplicate PostgreSQL digest key")
 
     inserts: list[GoldRowPayload] = []
     updates: list[GoldRowPayload] = []
     deletes: list[GoldRowKey] = []
     unchanged: list[GoldRowKey] = []
-
-    for key in sorted(source_by_key):
-        payload, source_digest = source_by_key[key]
-        target_digest = target_by_key.get(key)
-        if target_digest is None:
+    source_digests: list[GoldRowDigest] = []
+    source_index = 0
+    target_index = 0
+    while source_index < len(ordered_source) and target_index < len(ordered_target):
+        payload, source_digest = ordered_source[source_index]
+        target_digest = ordered_target[target_index]
+        if payload.key < target_digest.key:
             inserts.append(payload)
-        elif target_digest.row_sha256 == source_digest.row_sha256:
-            unchanged.append(key)
+            source_digests.append(source_digest)
+            source_index += 1
+        elif target_digest.key < payload.key:
+            deletes.append(target_digest.key)
+            target_index += 1
         else:
-            updates.append(payload)
+            source_digests.append(source_digest)
+            if target_digest.row_sha256 == source_digest.row_sha256:
+                unchanged.append(payload.key)
+            else:
+                updates.append(payload)
+            source_index += 1
+            target_index += 1
 
-    for key in sorted(target_by_key):
-        if key not in source_by_key:
-            deletes.append(key)
+    while source_index < len(ordered_source):
+        payload, source_digest = ordered_source[source_index]
+        inserts.append(payload)
+        source_digests.append(source_digest)
+        source_index += 1
+    while target_index < len(ordered_target):
+        deletes.append(ordered_target[target_index].key)
+        target_index += 1
 
     return GoldDeltaPlan(
         inserts=tuple(inserts),
         updates=tuple(updates),
         deletes=tuple(deletes),
         unchanged=tuple(unchanged),
-        source_digests=tuple(digest for _, digest in source_pairs),
+        source_digests=tuple(source_digests),
     )
