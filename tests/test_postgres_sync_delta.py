@@ -31,19 +31,23 @@ def test_canonical_hash_is_type_and_value_sensitive() -> None:
     assert canonical_row_hash(negative_zero) == canonical_row_hash(positive_zero)
 
 
-def test_invalid_timestamp_and_non_finite_values_fail() -> None:
+def test_invalid_timestamps_fail_and_non_finite_floats_hash_stably() -> None:
     aware = datetime(2026, 1, 1, tzinfo=UTC)
     with pytest.raises(ValueError):
         canonical_row_hash(_row(aware.replace(tzinfo=None), 1.0))
     with pytest.raises(ValueError):
         canonical_row_hash(_row(aware.astimezone(timezone(timedelta(hours=1))), 1.0))
-    with pytest.raises(ValueError):
-        canonical_row_hash(_row(aware, float("nan")))
+    nan_hash = canonical_row_hash(_row(aware, float("nan")))
+    assert nan_hash == canonical_row_hash(_row(aware, float("nan")))
+    assert nan_hash != canonical_row_hash(_row(aware, None))
+    assert canonical_row_hash(_row(aware, float("inf"))) != canonical_row_hash(_row(aware, float("-inf")))
+    assert canonical_row_hash(_row(aware, float("inf"))) != nan_hash
 
 
-def test_invalid_canonical_values_fail() -> None:
-    with pytest.raises(ValueError, match="non-finite decimal"):
-        canonical_row_hash({"value": Decimal("Infinity")})
+def test_non_finite_decimals_hash_stably_and_unsupported_values_fail() -> None:
+    assert canonical_row_hash({"value": Decimal("Infinity")}) == canonical_row_hash({"value": Decimal("Infinity")})
+    assert canonical_row_hash({"value": Decimal("NaN")}) == canonical_row_hash({"value": Decimal("NaN")})
+    assert canonical_row_hash({"value": Decimal("Infinity")}) != canonical_row_hash({"value": Decimal("-Infinity")})
     with pytest.raises(TypeError, match="unsupported deterministic hash value type"):
         canonical_row_hash({"value": object()})
     assert canonical_row_hash({"nested": {"b": 2, "a": [None, "value"]}}) == canonical_row_hash(
@@ -104,6 +108,23 @@ def test_mixed_complete_state_delta_is_exact() -> None:
         + list(plan.unchanged)
     )
     assert len(all_keys) == len(set(all_keys))
+
+
+def test_delta_merge_handles_unsorted_source_and_target_without_changing_results() -> None:
+    timestamps = [datetime(2026, 1, day, tzinfo=UTC) for day in range(1, 5)]
+    source = [_row(timestamps[3], 4.0), _row(timestamps[0], 1.0), _row(timestamps[2], 30.0)]
+    target = (
+        GoldRowDigest(GoldRowKey("deribit", "BTC", timestamps[2]), canonical_row_hash(_row(timestamps[2], 3.0))),
+        GoldRowDigest(GoldRowKey("deribit", "BTC", timestamps[1]), canonical_row_hash(_row(timestamps[1], 2.0))),
+        GoldRowDigest(GoldRowKey("deribit", "BTC", timestamps[0]), canonical_row_hash(_row(timestamps[0], 1.0))),
+    )
+
+    plan = plan_gold_delta(source, target, state_exists=True)
+
+    assert [payload.key.timestamp_m1 for payload in plan.inserts] == [timestamps[3]]
+    assert [payload.key.timestamp_m1 for payload in plan.updates] == [timestamps[2]]
+    assert plan.deletes == (GoldRowKey("deribit", "BTC", timestamps[1]),)
+    assert plan.unchanged == (GoldRowKey("deribit", "BTC", timestamps[0]),)
 
 
 def test_historical_correction_is_detected_without_watermark() -> None:

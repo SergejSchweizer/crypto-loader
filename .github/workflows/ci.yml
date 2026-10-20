@@ -156,6 +156,8 @@ jobs:
           --health-retries 12
     env:
       TEST_POSTGRES_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_RUNTIME_DSN: postgresql://crypto-loader:crypto-runtime-test-only@127.0.0.1:5432/crypto_loader_test
 
     steps:
       - name: Checkout repository
@@ -184,6 +186,9 @@ jobs:
           connection = psycopg.connect(os.environ['TEST_POSTGRES_DSN'], connect_timeout=5);
           connection.execute('SELECT 1').fetchone();
           connection.close()"
+
+      - name: Provision isolated PostgreSQL runtime role
+        run: uv run python scripts/provision_ci_postgres.py
 
       - name: Integration test shard
         run: >
@@ -214,6 +219,8 @@ jobs:
           --health-retries 12
     env:
       TEST_POSTGRES_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_RUNTIME_DSN: postgresql://crypto-loader:crypto-runtime-test-only@127.0.0.1:5432/crypto_loader_test
 
     steps:
       - name: Checkout repository
@@ -242,6 +249,9 @@ jobs:
           connection = psycopg.connect(os.environ['TEST_POSTGRES_DSN'], connect_timeout=5);
           connection.execute('SELECT 1').fetchone();
           connection.close()"
+
+      - name: Provision isolated PostgreSQL runtime role
+        run: uv run python scripts/provision_ci_postgres.py
 
       - name: Full test suite with 90 percent coverage gate
         run: uv run pytest --cov-fail-under=90 --cov-report=term-missing
@@ -435,6 +445,8 @@ jobs:
           --health-retries 12
     env:
       TEST_POSTGRES_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_ADMIN_DSN: postgresql://postgres:postgres-test-only@127.0.0.1:5432/crypto_loader_test
+      TEST_POSTGRES_RUNTIME_DSN: postgresql://crypto-loader:crypto-runtime-test-only@127.0.0.1:5432/crypto_loader_test
 
     steps:
       - name: Checkout repository
@@ -463,6 +475,9 @@ jobs:
           connection = psycopg.connect(os.environ['TEST_POSTGRES_DSN'], connect_timeout=5);
           connection.execute('SELECT 1').fetchone();
           connection.close()"
+
+      - name: Provision isolated PostgreSQL runtime role
+        run: uv run python scripts/provision_ci_postgres.py
 
       - name: Integration test shard with coverage
         run: >

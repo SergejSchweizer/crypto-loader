@@ -66,7 +66,11 @@ def test_success_emits_deterministic_credential_free_payload(
         return repo
 
     monkeypatch.setattr(postgres_cmd, "PostgresGoldSyncRepository", fake_repository)
-    monkeypatch.setattr(postgres_cmd, "synchronize_gold_root", lambda root, repository: GoldSyncResult(()))
+    monkeypatch.setattr(
+        postgres_cmd,
+        "synchronize_gold_root",
+        lambda root, repository, **kwargs: GoldSyncResult(()),
+    )
 
     postgres_cmd.run_gold_sync_postgres(argparse.Namespace(gold_root="lake/gold"), logging.getLogger("test"))
     payload = json.loads(capsys.readouterr().out)
@@ -87,7 +91,7 @@ def test_service_failure_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_valid_env(monkeypatch)
     monkeypatch.setattr(postgres_cmd, "PostgresGoldSyncRepository", lambda settings: object())
 
-    def fail(root: object, repository: object) -> GoldSyncResult:
+    def fail(root: object, repository: object, **kwargs: object) -> GoldSyncResult:
         raise OSError("gold root unavailable")
 
     monkeypatch.setattr(postgres_cmd, "synchronize_gold_root", fail)
@@ -99,8 +103,8 @@ def test_declared_certification_failure_is_sanitized(monkeypatch: pytest.MonkeyP
     _set_valid_env(monkeypatch)
     monkeypatch.setattr(postgres_cmd, "PostgresGoldSyncRepository", lambda settings: object())
 
-    def fail(root: object, repository: object, *, publication_result: object) -> GoldSyncResult:
-        del root, repository, publication_result
+    def fail(root: object, repository: object, *, publication_result: object, **kwargs: object) -> GoldSyncResult:
+        del root, repository, publication_result, kwargs
         raise ValueError("/private/runtime/path/tampered.parquet SHA-256 mismatch")
 
     monkeypatch.setattr(postgres_cmd, "synchronize_gold_root", fail)
@@ -164,10 +168,16 @@ def test_declared_publication_result_is_forwarded(monkeypatch: pytest.MonkeyPatc
 
     _set_valid_env(monkeypatch)
     monkeypatch.setattr(postgres_cmd, "PostgresGoldSyncRepository", lambda settings: object())
-    calls: list[tuple[Path, Path]] = []
+    calls: list[tuple[Path, Path, int]] = []
 
-    def synchronize(root: Path, _: object, *, publication_result: Path) -> GoldSyncResult:
-        calls.append((root, publication_result))
+    def synchronize(
+        root: Path,
+        _: object,
+        *,
+        publication_result: Path,
+        max_parallel_lineages: int,
+    ) -> GoldSyncResult:
+        calls.append((root, publication_result, max_parallel_lineages))
         return GoldSyncResult(())
 
     monkeypatch.setattr(postgres_cmd, "synchronize_gold_root", synchronize)
@@ -176,4 +186,4 @@ def test_declared_publication_result_is_forwarded(monkeypatch: pytest.MonkeyPatc
         logging.getLogger("test"),
     )
 
-    assert calls == [(Path("lake/gold"), Path(".run/gold-publication-result.json"))]
+    assert calls == [(Path("lake/gold"), Path(".run/gold-publication-result.json"), 2)]

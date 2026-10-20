@@ -122,6 +122,11 @@ Run the full configured pipeline:
 uv run python scripts/run_medallion_pipeline.py --config config.yaml
 ```
 
+The scheduled Medallion configuration builds historical Silver inputs and the canonical and extended
+Gold history datasets (`m1`, `m5`, `m30`, `h1`) only. Live snapshot/L2 Silver datasets and all
+`gold.live.*` outputs are excluded; the following PostgreSQL sync publishes the Gold artifacts from
+that history-only build.
+
 Build Bronze:
 
 ```bash
@@ -274,6 +279,8 @@ Gold mirror:
 - every successful `gold-build` mirrors `lake/gold` to `/volume1/Temp/gold`
 - the mirror uses `rsync -a --delete`, copying only changed files and removing stale destination artifacts
 - use `--no-mirror-gold-to-temp` only when a successful build must not update the NAS staging copy
+- a separate Sunday 21:00 server-local cron job copies every `*.parquet` file, preserving the Gold directory structure under `/volume1/Temp/Quotes`
+- this weekly copy is additive: it updates changed Parquet files and leaves non-Parquet or stale destination files untouched
 
 ## Quality gates
 

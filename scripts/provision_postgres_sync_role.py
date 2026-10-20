@@ -45,6 +45,8 @@ class ProvisioningCursor(Protocol):
 
     def fetchall(self) -> list[tuple[object, ...]]: ...
 
+    def close(self) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ProvisioningConfig:

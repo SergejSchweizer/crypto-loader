@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,9 +15,11 @@ from application.postgres_sync import (
     GoldRowDigest,
     GoldRowKey,
     GoldSourceSnapshot,
+    GoldSyncLineageResult,
     GoldSyncState,
     GoldTargetSummary,
 )
+from application.postgres_sync import service as postgres_sync_service
 from application.postgres_sync.contracts import GoldReconcileDecision, GoldReconcilePlanner
 from application.postgres_sync.delta import canonical_row_hash
 from application.postgres_sync.service import GoldSyncServiceError, reconcile_snapshots
@@ -211,6 +216,70 @@ def test_service_uses_only_locked_repository_unit_of_work(tmp_path: Path) -> Non
     ]
 
 
+def test_source_parquet_validation_and_digesting_precede_repository_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshot = _write_snapshot(tmp_path, rows=((timestamp, 1.0),))
+    prepared: list[str] = []
+    validate_rows = postgres_sync_service._validated_source_rows
+    build_digests = postgres_sync_service.build_source_digests
+
+    def track_validation(source: GoldSourceSnapshot) -> Iterator[dict[str, object]]:
+        rows = validate_rows(source)
+        prepared.append("rows")
+        return rows
+
+    def track_digests(rows: object) -> tuple[tuple[object, object], ...]:
+        digests = build_digests(rows)  # type: ignore[arg-type]
+        prepared.append("digests")
+        return digests
+
+    monkeypatch.setattr(postgres_sync_service, "_validated_source_rows", track_validation)
+    monkeypatch.setattr(postgres_sync_service, "build_source_digests", track_digests)
+
+    class CheckingRepository(FakeRepository):
+        def reconcile_lineage(
+            self,
+            snapshot: GoldSourceSnapshot,
+            ddl: str,
+            schema_signature: str,
+            planner: GoldReconcilePlanner,
+        ) -> GoldReconcileDecision:
+            assert prepared == ["rows", "digests"]
+            return super().reconcile_lineage(snapshot, ddl, schema_signature, planner)
+
+    result = reconcile_snapshots((snapshot,), CheckingRepository(), clock=_fixed_clock)
+
+    assert result.inserted == 1
+
+
+def test_streaming_repository_receives_lazy_source_rows(tmp_path: Path) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshot = _write_snapshot(tmp_path, rows=((timestamp, 1.0),))
+
+    class StreamingRepository(FakeRepository):
+        def reconcile_lineage_stream(
+            self,
+            source: GoldSourceSnapshot,
+            ddl: str,
+            schema_signature: str,
+            source_rows: Iterable[Mapping[str, object]],
+            next_state: GoldSyncState,
+        ) -> GoldSyncLineageResult:
+            assert "CREATE TABLE IF NOT EXISTS" in ddl
+            assert schema_signature == next_state.schema_signature
+            assert source_rows.__class__.__name__ == "generator"
+            rows = tuple(source_rows)
+            assert len(rows) == source.row_count
+            return GoldSyncLineageResult(source.lineage, source.source_fingerprint, 1, 0, 0, 0, "synchronized")
+
+    result = reconcile_snapshots((snapshot,), StreamingRepository(), clock=_fixed_clock)
+
+    assert result.inserted == 1
+
+
 def test_processing_is_stable_and_stops_on_first_failure(tmp_path: Path) -> None:
     timestamp = datetime(2026, 1, 1, tzinfo=UTC)
     btc = _write_snapshot(tmp_path, symbol="BTC", rows=((timestamp, 1.0),), fingerprint="btc")
@@ -220,12 +289,70 @@ def test_processing_is_stable_and_stops_on_first_failure(tmp_path: Path) -> None
     repository.fail_lineage = eth.lineage
 
     with pytest.raises(GoldSyncServiceError) as exc_info:
-        reconcile_snapshots((sol, eth, btc), repository, clock=_fixed_clock)
+        reconcile_snapshots((sol, eth, btc), repository, clock=_fixed_clock, max_parallel_lineages=1)
 
     assert exc_info.value.lineage == eth.lineage
     assert [lineage.symbol for lineage in repository.ensure_calls] == ["BTC", "ETH"]
     assert btc.lineage in repository.states
     assert sol.lineage not in repository.states
+
+
+def test_small_lineages_reconcile_in_parallel_but_large_lineage_is_exclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshots = tuple(
+        _write_snapshot(tmp_path, symbol=symbol, rows=((timestamp, float(index + 1)),))
+        for index, symbol in enumerate(("BTC", "ETH", "SOL"))
+    )
+    budget = postgres_sync_service._PARALLEL_MEMORY_BUDGET_BYTES
+    monkeypatch.setattr(
+        postgres_sync_service,
+        "_estimated_source_memory",
+        lambda snapshot: budget + 1 if snapshot.lineage.symbol == "BTC" else 1,
+    )
+    light_workers = threading.Barrier(2, timeout=3)
+
+    class TrackingRepository(FakeRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+            self.active: set[str] = set()
+            self.max_active = 0
+
+        def reconcile_lineage(
+            self,
+            snapshot: GoldSourceSnapshot,
+            ddl: str,
+            schema_signature: str,
+            planner: GoldReconcilePlanner,
+        ) -> GoldReconcileDecision:
+            symbol = snapshot.lineage.symbol
+            with self.lock:
+                assert "BTC" not in self.active or symbol == "BTC"
+                assert symbol != "BTC" or not self.active
+                self.active.add(symbol)
+                self.max_active = max(self.max_active, len(self.active))
+            try:
+                if symbol != "BTC":
+                    light_workers.wait()
+                time.sleep(0.02)
+                return super().reconcile_lineage(snapshot, ddl, schema_signature, planner)
+            finally:
+                with self.lock:
+                    self.active.remove(symbol)
+
+    repository = TrackingRepository()
+    result = reconcile_snapshots(snapshots, repository, clock=_fixed_clock)
+
+    assert [item.lineage.symbol for item in result.lineages] == ["BTC", "ETH", "SOL"]
+    assert repository.max_active == 2
+
+
+def test_parallel_lineage_limit_must_be_one_or_two(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_parallel_lineages must be 1 or 2"):
+        reconcile_snapshots((), FakeRepository(), max_parallel_lineages=3)
 
 
 def test_preexisting_digests_without_state_fail_closed(tmp_path: Path) -> None:

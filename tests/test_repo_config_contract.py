@@ -129,3 +129,63 @@ def test_repo_config_medallion_bronze_uses_tail_delta_mode() -> None:
 
     assert "--tail-delta-only" in bronze_step.args
     assert "--full-gap-fill" not in bronze_step.args
+
+
+def test_repo_medallion_schedule_builds_only_history_datasets() -> None:
+    module = _load_pipeline_module()
+    config = _load_repo_config()
+    steps = module._build_steps(
+        main_path=_repo_root() / "main.py",
+        config_path=_repo_config_path(),
+        config_data=config,
+    )
+    silver_step = next(step for step in steps if step.name == "silver")
+    gold_step = next(step for step in steps if step.name == "gold")
+
+    silver_dataset_index = silver_step.args.index("--dataset")
+    silver_datasets = []
+    for value in silver_step.args[silver_dataset_index + 1 :]:
+        if value.startswith("--"):
+            break
+        silver_datasets.append(value)
+    live_silver_datasets = {
+        "index_price_snapshot_1m",
+        "futures_summary_snapshot_1m",
+        "options_ticker_snapshot_1m",
+        "options_instrument_ticker_snapshot_1m",
+        "options_surface_1m_feature",
+        "perps_l2_snapshot_1m",
+        "options_l2_snapshot_1m",
+        "recent_trade_snapshot_1m",
+        "instrument_metadata_snapshot_daily",
+        "futures_instrument_metadata_snapshot_daily",
+    }
+    assert live_silver_datasets.isdisjoint(silver_datasets)
+    assert {"spot_ohlcv", "perps_ohlcv", "perps_trades", "options_trades"}.issubset(silver_datasets)
+    assert "historical_prediction" in silver_datasets
+
+    exclusion_index = gold_step.args.index("--exclude-dataset-id")
+    excluded_dataset_ids = []
+    for value in gold_step.args[exclusion_index + 1 :]:
+        if value.startswith("--"):
+            break
+        excluded_dataset_ids.append(value)
+    assert "gold.history.extended_full.m1" in excluded_dataset_ids
+    history_dataset_ids = {
+        "gold.history.extended.m1",
+        "gold.history.extended.m5",
+        "gold.history.extended.m30",
+        "gold.history.extended.h1",
+    }
+    assert history_dataset_ids.isdisjoint(excluded_dataset_ids)
+    live_dataset_ids = {
+        "gold.live.full.m1",
+        "gold.live.full.m5",
+        "gold.live.full.m30",
+        "gold.live.full.h1",
+        "gold.live.extended.m1",
+        "gold.live.extended.m5",
+        "gold.live.extended.m30",
+        "gold.live.extended.h1",
+    }
+    assert live_dataset_ids.issubset(excluded_dataset_ids)

@@ -72,6 +72,8 @@ ignore_missing_imports = true
 [tool.pyright]
 include = ["api", "application", "ingestion", "scripts"]
 exclude = ["tests", "notebooks", ".venv"]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.14"
 typeCheckingMode = "standard"
 

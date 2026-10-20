@@ -13,9 +13,10 @@ _REQUIRED_KEYS = ("PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD")
 _TIMEOUT_DEFAULTS = {
     "PGCONNECT_TIMEOUT_S": 10,
     "PGLOCK_TIMEOUT_MS": 5_000,
-    "PGSTATEMENT_TIMEOUT_MS": 30_000,
-    "PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS": 60_000,
+    "PGSTATEMENT_TIMEOUT_MS": 3_600_000,
+    "PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS": 3_600_000,
 }
+_MAX_PARALLEL_LINEAGES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,7 @@ class PostgresSyncConfig:
     lock_timeout_ms: int = _TIMEOUT_DEFAULTS["PGLOCK_TIMEOUT_MS"]
     statement_timeout_ms: int = _TIMEOUT_DEFAULTS["PGSTATEMENT_TIMEOUT_MS"]
     idle_in_transaction_session_timeout_ms: int = _TIMEOUT_DEFAULTS["PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS"]
+    max_parallel_lineages: int = _MAX_PARALLEL_LINEAGES
 
     def __post_init__(self) -> None:
         if self.host != POSTGRES_HOST:
@@ -51,6 +53,12 @@ class PostgresSyncConfig:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(self.max_parallel_lineages, int)
+            or isinstance(self.max_parallel_lineages, bool)
+            or self.max_parallel_lineages not in (1, _MAX_PARALLEL_LINEAGES)
+        ):
+            raise ValueError("PGSYNC_MAX_WORKERS must be 1 or 2")
 
     @classmethod
     def from_sources(
@@ -86,6 +94,11 @@ class PostgresSyncConfig:
                 timeout_values[key] = int(str(raw_timeout).strip())
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must be a positive integer") from exc
+        try:
+            raw_workers = env.get("PGSYNC_MAX_WORKERS", runtime.get("PGSYNC_MAX_WORKERS", _MAX_PARALLEL_LINEAGES))
+            max_parallel_lineages = int(str(raw_workers).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PGSYNC_MAX_WORKERS must be 1 or 2") from exc
         return cls(
             host=resolved["PGHOST"].strip(),
             port=port,
@@ -96,6 +109,7 @@ class PostgresSyncConfig:
             lock_timeout_ms=timeout_values["PGLOCK_TIMEOUT_MS"],
             statement_timeout_ms=timeout_values["PGSTATEMENT_TIMEOUT_MS"],
             idle_in_transaction_session_timeout_ms=timeout_values["PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS"],
+            max_parallel_lineages=max_parallel_lineages,
         )
 
     @classmethod
@@ -124,4 +138,5 @@ class PostgresSyncConfig:
             "user": self.user,
             "database": self.database,
             "password": "<redacted>",
+            "max_parallel_lineages": self.max_parallel_lineages,
         }

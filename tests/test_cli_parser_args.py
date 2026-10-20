@@ -249,7 +249,19 @@ def test_medallion_pipeline_schedules_configured_silver_and_gold_runs() -> None:
         if token_value.startswith("--"):
             break
         silver_datasets.add(token_value)
-    assert silver_datasets == EXPECTED_MEDALLION_SILVER_DATASETS - {"historical_prediction"}
+    scheduled_live_silver_exclusions = {
+        "futures_instrument_metadata_snapshot_daily",
+        "futures_summary_snapshot_1m",
+        "index_price_snapshot_1m",
+        "instrument_metadata_snapshot_daily",
+        "options_instrument_ticker_snapshot_1m",
+        "options_l2_snapshot_1m",
+        "options_surface_1m_feature",
+        "options_ticker_snapshot_1m",
+        "perps_l2_snapshot_1m",
+        "recent_trade_snapshot_1m",
+    }
+    assert silver_datasets == EXPECTED_MEDALLION_SILVER_DATASETS - scheduled_live_silver_exclusions
     assert "--plot" not in silver_args
 
     gold_cfg = pipeline_cfg.get("gold")
@@ -259,11 +271,15 @@ def test_medallion_pipeline_schedules_configured_silver_and_gold_runs() -> None:
     assert "--dataset-id" not in gold_args
     assert "--exclude-dataset-id" in gold_args
     assert set(gold_args[gold_args.index("--exclude-dataset-id") + 1 : gold_args.index("--manifest")]) == {
-        "gold.history.extended.m1",
-        "gold.history.extended.m5",
-        "gold.history.extended.m30",
-        "gold.history.extended.h1",
         "gold.history.extended_full.m1",
+        "gold.live.extended.h1",
+        "gold.live.extended.m1",
+        "gold.live.extended.m30",
+        "gold.live.extended.m5",
+        "gold.live.full.h1",
+        "gold.live.full.m1",
+        "gold.live.full.m30",
+        "gold.live.full.m5",
     }
 
 

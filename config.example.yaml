@@ -12,6 +12,9 @@ env:
   PGUSER: crypto-loader
   PGDATABASE: postgres
   PGPASSWORD: "<set-in-local-config.yaml>"
+  PGSTATEMENT_TIMEOUT_MS: 3600000
+  PGIDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: 3600000
+  PGSYNC_MAX_WORKERS: 2
 export-descriptive-stats:
   lake_root: lake/bronze
   output_csv: docs/tables/descriptive_stats.csv
@@ -79,31 +82,27 @@ medallion-pipeline:
       - volatility_index_snapshot_1m
       - realized_volatility
       - iv_rv
-      - index_price_snapshot_1m
-      - futures_summary_snapshot_1m
-      - options_ticker_snapshot_1m
-      - options_instrument_ticker_snapshot_1m
-      - options_surface_1m_feature
-      - perps_l2_snapshot_1m
-      - options_l2_snapshot_1m
-      - recent_trade_snapshot_1m
-      - instrument_metadata_snapshot_daily
-      - futures_instrument_metadata_snapshot_daily
       - historical_volatility
+      - historical_prediction
       - --manifest
       - --maxprocesses
-      - "4"
+      - "1"
       - --no-json-output
   gold:
     enabled: true
     command: gold-build
     cli_args:
+      # Keep scheduled Gold builds limited to the canonical and extended history families.
       - --exclude-dataset-id
-      - gold.history.extended.m1
-      - gold.history.extended.m5
-      - gold.history.extended.m30
-      - gold.history.extended.h1
       - gold.history.extended_full.m1
+      - gold.live.extended.h1
+      - gold.live.extended.m1
+      - gold.live.extended.m30
+      - gold.live.extended.m5
+      - gold.live.full.h1
+      - gold.live.full.m1
+      - gold.live.full.m30
+      - gold.live.full.m5
       - --manifest
       - --plot
       - --maxprocesses

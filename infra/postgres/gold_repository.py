@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from heapq import merge as merge_sorted
 from typing import Protocol, cast
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from application.postgres_sync import (
     POSTGRES_CONSUMER_SCHEMA,
@@ -23,9 +26,12 @@ from application.postgres_sync import (
     GoldRowDigest,
     GoldRowKey,
     GoldSourceSnapshot,
+    GoldSyncLineageResult,
     GoldSyncState,
     GoldTargetSummary,
     consumer_table_name,
+    expected_target_summary,
+    state_matches_snapshot,
 )
 from application.postgres_sync.contracts import GoldReconcileDecision, GoldReconcilePlanner
 from application.postgres_sync.delta import canonical_row_hash
@@ -40,6 +46,26 @@ from application.postgres_sync.schema import (
 class PostgresGoldRepositoryError(RuntimeError):
     """Sanitized PostgreSQL adapter failure."""
 
+    def __init__(self, message: str, *, safe_detail: str | None = None) -> None:
+        super().__init__(message)
+        self.safe_detail = safe_detail
+
+
+def _safe_database_error_code(exc: Exception, *, password: str | None = None) -> str:
+    error_type = type(exc).__name__
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str) and len(sqlstate) == 5 and sqlstate.isalnum():
+        error_type = f"{error_type} (SQLSTATE {sqlstate})"
+    if isinstance(exc, psycopg.OperationalError):
+        message = str(exc)
+        if password:
+            message = message.replace(password, "<redacted>")
+        message = re.sub(r"(?i)(password\s*[=:]\s*)\S+", r"\1<redacted>", message)
+        message = " ".join(message.split())[:240]
+        if message:
+            return f"{error_type}: {message}"
+    return error_type
+
 
 class PostgresSchemaMismatchError(PostgresGoldRepositoryError):
     """Existing target schema/checkpoint is incompatible with the current source."""
@@ -51,15 +77,19 @@ class CursorPort(Protocol):
 
     def execute(self, query: str, params: Sequence[object] | None = None) -> object: ...
 
+    def executemany(self, query: str, params_seq: Iterable[Sequence[object]]) -> object: ...
+
     def fetchone(self) -> tuple[object, ...] | None: ...
 
     def fetchall(self) -> list[tuple[object, ...]]: ...
+
+    def fetchmany(self, size: int = 1) -> list[tuple[object, ...]]: ...
 
     def close(self) -> None: ...
 
 
 class ConnectionPort(Protocol):
-    def cursor(self) -> CursorPort: ...
+    def cursor(self, name: str | None = None) -> CursorPort: ...
 
     def commit(self) -> None: ...
 
@@ -144,6 +174,10 @@ VALUES (%s, %s, %s, %s, %s)
 ON CONFLICT (dataset_id, exchange, symbol, timestamp_m1)
 DO UPDATE SET row_sha256 = EXCLUDED.row_sha256"""
 _DELETE_DIGEST = f"DELETE FROM {_DIGESTS} WHERE dataset_id = %s AND exchange = %s AND symbol = %s AND timestamp_m1 = %s"
+_CONSUMER_FETCH_BATCH_SIZE = 2_048
+_DIGEST_FETCH_BATCH_SIZE = 4_096
+_SOURCE_STAGE_BATCH_SIZE = 1_024
+_SOURCE_STAGE_TABLE = 'pg_temp."gold_sync_stage"'
 
 _CATALOG_COLUMNS = """SELECT table_schema, table_name, ordinal_position, column_name, data_type, is_nullable,
 character_maximum_length, numeric_precision, numeric_scale, datetime_precision
@@ -331,16 +365,22 @@ class PostgresGoldSyncRepository:
         self._connection_factory = connection_factory
 
     def _open(self) -> ConnectionPort:
+        connection: ConnectionPort | None = None
+        stage = "connect"
         try:
             connection = self._connection_factory(self._settings)
             cursor = connection.cursor()
             try:
+                stage = "set session timezone"
                 cursor.execute(f"SET TIME ZONE '{POSTGRES_SESSION_TIMEZONE}'")
+                stage = "set lock timeout"
                 cursor.execute("SELECT set_config('lock_timeout', %s, false)", (f"{self._settings.lock_timeout_ms}ms",))
+                stage = "set statement timeout"
                 cursor.execute(
                     "SELECT set_config('statement_timeout', %s, false)",
                     (f"{self._settings.statement_timeout_ms}ms",),
                 )
+                stage = "set idle transaction timeout"
                 cursor.execute(
                     "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
                     (f"{self._settings.idle_in_transaction_session_timeout_ms}ms",),
@@ -348,8 +388,16 @@ class PostgresGoldSyncRepository:
             finally:
                 cursor.close()
             return connection
-        except Exception:
-            raise PostgresGoldRepositoryError("PostgreSQL connection initialization failed") from None
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            raise PostgresGoldRepositoryError(
+                "PostgreSQL connection initialization failed",
+                safe_detail=f"{stage}: {_safe_database_error_code(exc, password=self._settings.password)}",
+            ) from None
 
     @staticmethod
     def _read_state(cursor: CursorPort, lineage: GoldLineage) -> GoldSyncState | None:
@@ -358,30 +406,34 @@ class PostgresGoldSyncRepository:
         return None if row is None else _state_from_row(row)
 
     @staticmethod
-    def _read_digests(cursor: CursorPort, lineage: GoldLineage) -> tuple[GoldRowDigest, ...]:
-        cursor.execute(_SELECT_DIGESTS, _lineage_params(lineage))
-        rows = cursor.fetchall()
-        result: list[GoldRowDigest] = []
-        for row in rows:
-            if len(row) != 2:
-                raise ValueError("PostgreSQL Gold digest row has unexpected width")
-            timestamp = _as_datetime(row[0], "timestamp_m1")
-            if timestamp is None:
-                raise ValueError("PostgreSQL Gold digest timestamp cannot be null")
-            result.append(
-                GoldRowDigest(
-                    GoldRowKey(lineage.exchange, lineage.symbol, timestamp),
-                    _as_text(row[1], "row_sha256"),
-                )
-            )
-        return tuple(result)
+    def _iter_digests(connection: ConnectionPort, lineage: GoldLineage) -> Iterator[GoldRowDigest]:
+        cursor = connection.cursor(name="gold_digest_state")
+        try:
+            cursor.execute(_SELECT_DIGESTS, _lineage_params(lineage))
+            while rows := cursor.fetchmany(_DIGEST_FETCH_BATCH_SIZE):
+                for row in rows:
+                    if len(row) != 2:
+                        raise ValueError("PostgreSQL Gold digest row has unexpected width")
+                    timestamp = _as_datetime(row[0], "timestamp_m1")
+                    if timestamp is None:
+                        raise ValueError("PostgreSQL Gold digest timestamp cannot be null")
+                    yield GoldRowDigest(
+                        GoldRowKey(lineage.exchange, lineage.symbol, timestamp),
+                        _as_text(row[1], "row_sha256"),
+                    )
+        finally:
+            cursor.close()
+
+    @classmethod
+    def _read_digests(cls, connection: ConnectionPort, lineage: GoldLineage) -> tuple[GoldRowDigest, ...]:
+        return tuple(cls._iter_digests(connection, lineage))
 
     @staticmethod
-    def _read_consumer_digests(
-        cursor: CursorPort,
+    def _iter_consumer_digests(
+        connection: ConnectionPort,
         lineage: GoldLineage,
         consumer_table: PostgresCatalogTable,
-    ) -> tuple[GoldRowDigest, ...]:
+    ) -> Iterator[GoldRowDigest]:
         column_names = tuple(column.name for column in consumer_table.columns)
         table = _qualified(consumer_table.schema_name, consumer_table.table_name)
         query = (
@@ -389,24 +441,25 @@ class PostgresGoldSyncRepository:
             f"WHERE {quote_identifier('exchange')} = %s AND {quote_identifier('symbol')} = %s "
             f"ORDER BY {quote_identifier('timestamp_m1')}"
         )
-        cursor.execute(query, (lineage.exchange, lineage.symbol))
-        result: list[GoldRowDigest] = []
-        for row in cursor.fetchall():
-            if len(row) != len(column_names):
-                raise ValueError("PostgreSQL Gold consumer row has unexpected width")
-            values = dict(zip(column_names, row, strict=True))
-            exchange = _as_text(values["exchange"], "consumer exchange")
-            symbol = _as_text(values["symbol"], "consumer symbol")
-            timestamp = _as_datetime(values["timestamp_m1"], "consumer timestamp_m1")
-            if timestamp is None:
-                raise ValueError("PostgreSQL Gold consumer timestamp cannot be null")
-            result.append(
-                GoldRowDigest(
-                    GoldRowKey(exchange, symbol, timestamp),
-                    canonical_row_hash(values),
-                )
-            )
-        return tuple(result)
+        cursor = connection.cursor(name="gold_consumer_integrity")
+        try:
+            cursor.execute(query, (lineage.exchange, lineage.symbol))
+            while rows := cursor.fetchmany(_CONSUMER_FETCH_BATCH_SIZE):
+                for row in rows:
+                    if len(row) != len(column_names):
+                        raise ValueError("PostgreSQL Gold consumer row has unexpected width")
+                    values = dict(zip(column_names, row, strict=True))
+                    exchange = _as_text(values["exchange"], "consumer exchange")
+                    symbol = _as_text(values["symbol"], "consumer symbol")
+                    timestamp = _as_datetime(values["timestamp_m1"], "consumer timestamp_m1")
+                    if timestamp is None:
+                        raise ValueError("PostgreSQL Gold consumer timestamp cannot be null")
+                    yield GoldRowDigest(
+                        GoldRowKey(exchange, symbol, timestamp),
+                        canonical_row_hash(values),
+                    )
+        finally:
+            cursor.close()
 
     def ensure_lineage(self, snapshot: GoldSourceSnapshot, ddl: str, schema_signature: str) -> None:
         """Validate actual target catalogs before any consumer-row mutation."""
@@ -452,11 +505,7 @@ class PostgresGoldSyncRepository:
     def read_digests(self, lineage: GoldLineage) -> tuple[GoldRowDigest, ...]:
         connection = self._open()
         try:
-            cursor = connection.cursor()
-            try:
-                return self._read_digests(cursor, lineage)
-            finally:
-                cursor.close()
+            return self._read_digests(connection, lineage)
         except Exception:
             raise PostgresGoldRepositoryError("PostgreSQL Gold digest read failed") from None
         finally:
@@ -489,48 +538,50 @@ class PostgresGoldSyncRepository:
             connection.close()
 
     @staticmethod
-    def _digest_map(plan: GoldDeltaPlan) -> dict[GoldRowKey, str]:
-        result: dict[GoldRowKey, str] = {}
-        for digest in plan.source_digests:
-            if digest.key in result:
-                raise ValueError("duplicate source digest in Gold delta plan")
-            result[digest.key] = digest.row_sha256
-        return result
-
-    @staticmethod
-    def _exact_digest_map(digests: Sequence[GoldRowDigest], source: str) -> dict[GoldRowKey, str]:
-        result: dict[GoldRowKey, str] = {}
-        for digest in digests:
-            if digest.key in result:
-                raise ValueError(f"duplicate logical key in PostgreSQL Gold {source}")
-            result[digest.key] = digest.row_sha256
-        return result
-
-    @classmethod
     def _verify_integrity(
-        cls,
         lineage: GoldLineage,
         state: GoldSyncState | None,
-        consumer_digests: Sequence[GoldRowDigest],
-        stored_digests: Sequence[GoldRowDigest],
-        source_digests: Sequence[GoldRowDigest] | None = None,
+        consumer_digests: Iterable[GoldRowDigest],
+        stored_digests: Iterable[GoldRowDigest],
+        source_digests: Iterable[GoldRowDigest] | None = None,
     ) -> None:
-        consumer = cls._exact_digest_map(consumer_digests, "consumer")
-        stored = cls._exact_digest_map(stored_digests, "digest table")
-        if consumer != stored:
+        sentinel = object()
+        stored = iter(stored_digests)
+        source = None if source_digests is None else iter(source_digests)
+        count = 0
+        minimum: datetime | None = None
+        maximum: datetime | None = None
+        previous: datetime | None = None
+
+        for consumer_digest in consumer_digests:
+            key = consumer_digest.key
+            if key.exchange != lineage.exchange or key.symbol != lineage.symbol:
+                raise ValueError("PostgreSQL Gold consumer row identity is inconsistent")
+            if previous is not None and key.timestamp_m1 <= previous:
+                raise ValueError("duplicate logical key in PostgreSQL Gold consumer")
+            expected_digest = next(stored, sentinel)
+            if expected_digest is sentinel or consumer_digest != expected_digest:
+                raise ValueError("PostgreSQL Gold consumer and digest table are inconsistent")
+            if source is not None:
+                expected_source = next(source, sentinel)
+                if expected_source is sentinel or consumer_digest != expected_source:
+                    raise ValueError("PostgreSQL Gold target does not exactly match canonical source")
+            previous = key.timestamp_m1
+            minimum = key.timestamp_m1 if minimum is None else minimum
+            maximum = key.timestamp_m1
+            count += 1
+
+        if next(stored, sentinel) is not sentinel:
             raise ValueError("PostgreSQL Gold consumer and digest table are inconsistent")
-        if source_digests is not None and consumer != cls._exact_digest_map(source_digests, "canonical source"):
+        if source is not None and next(source, sentinel) is not sentinel:
             raise ValueError("PostgreSQL Gold target does not exactly match canonical source")
         if state is None:
-            if consumer:
+            if count:
                 raise ValueError("PostgreSQL Gold target rows exist without an authoritative checkpoint")
             return
         if state.lineage != lineage:
             raise ValueError("PostgreSQL Gold checkpoint lineage is inconsistent")
-        timestamps = sorted(key.timestamp_m1 for key in consumer)
-        minimum = timestamps[0] if timestamps else None
-        maximum = timestamps[-1] if timestamps else None
-        if (state.row_count, state.min_timestamp, state.max_timestamp) != (len(consumer), minimum, maximum):
+        if (state.row_count, state.min_timestamp, state.max_timestamp) != (count, minimum, maximum):
             raise ValueError("PostgreSQL Gold checkpoint is inconsistent with exact target keys")
 
     def _insert_row(self, cursor: CursorPort, lineage: GoldLineage, values: tuple[tuple[str, object], ...]) -> None:
@@ -573,19 +624,33 @@ class PostgresGoldSyncRepository:
             raise ValueError("PostgreSQL Gold DELETE affected an unexpected number of rows")
 
     def _apply_plan(self, cursor: CursorPort, lineage: GoldLineage, plan: GoldDeltaPlan) -> None:
-        digest_map = self._digest_map(plan)
-        for payload in (*plan.inserts, *plan.updates):
-            if payload.key not in digest_map:
+        source_digests = iter(plan.source_digests)
+        previous_digest_key: GoldRowKey | None = None
+
+        def next_digest() -> GoldRowDigest | None:
+            nonlocal previous_digest_key
+            digest = next(source_digests, None)
+            if digest is not None:
+                if previous_digest_key is not None and digest.key <= previous_digest_key:
+                    raise ValueError("source digests are not uniquely ordered")
+                previous_digest_key = digest.key
+            return digest
+
+        current_digest = next_digest()
+        mutations = merge_sorted(
+            ((payload, True) for payload in sorted(plan.inserts, key=lambda item: item.key)),
+            ((payload, False) for payload in sorted(plan.updates, key=lambda item: item.key)),
+            key=lambda item: item[0].key,
+        )
+        for payload, is_insert in mutations:
+            while current_digest is not None and current_digest.key < payload.key:
+                current_digest = next_digest()
+            if current_digest is None or current_digest.key != payload.key:
                 raise ValueError("Gold delta mutation is missing its source digest")
-
-        for payload in plan.inserts:
-            self._insert_row(cursor, lineage, payload.values)
-        for payload in plan.updates:
-            self._update_row(cursor, lineage, payload.values)
-        for key in plan.deletes:
-            self._delete_row(cursor, lineage, key)
-
-        for payload in (*plan.inserts, *plan.updates):
+            if is_insert:
+                self._insert_row(cursor, lineage, payload.values)
+            else:
+                self._update_row(cursor, lineage, payload.values)
             cursor.execute(
                 _UPSERT_DIGEST,
                 (
@@ -593,9 +658,12 @@ class PostgresGoldSyncRepository:
                     lineage.exchange,
                     lineage.symbol,
                     payload.key.timestamp_m1,
-                    digest_map[payload.key],
+                    current_digest.row_sha256,
                 ),
             )
+            current_digest = next_digest()
+        for key in plan.deletes:
+            self._delete_row(cursor, lineage, key)
         for key in plan.deletes:
             cursor.execute(
                 _DELETE_DIGEST,
@@ -619,6 +687,391 @@ class PostgresGoldSyncRepository:
         if actual != expected:
             raise ValueError("PostgreSQL Gold post-write summary does not match source")
 
+    @staticmethod
+    def _stage_source_rows(
+        cursor: CursorPort,
+        rows: Iterable[Mapping[str, object]],
+        column_names: tuple[str, ...],
+        *,
+        expected_count: int,
+    ) -> None:
+        stage_columns = (*column_names, "row_sha256")
+        insert_query = (
+            f"INSERT INTO {_SOURCE_STAGE_TABLE} "
+            f"({', '.join(quote_identifier(name) for name in stage_columns)}) VALUES "
+            f"({', '.join('%s' for _ in stage_columns)})"
+        )
+        batch: list[tuple[object, ...]] = []
+        row_count = 0
+
+        def flush() -> None:
+            if batch:
+                cursor.executemany(insert_query, batch)
+                batch.clear()
+
+        for row in rows:
+            if tuple(row) != column_names:
+                raise ValueError("Gold source row columns differ from the registered PostgreSQL schema")
+            row_hash = canonical_row_hash(row)
+            values = tuple(Jsonb(value) if isinstance(value, (dict, list)) else value for value in row.values())
+            batch.append((*values, row_hash))
+            row_count += 1
+            if len(batch) >= _SOURCE_STAGE_BATCH_SIZE:
+                flush()
+        flush()
+        if row_count != expected_count:
+            raise ValueError("Gold source row count differs from the current manifest snapshot")
+
+    @staticmethod
+    def _stage_difference_counts(cursor: CursorPort, lineage: GoldLineage) -> tuple[int, int, int]:
+        digest_table = _qualified(POSTGRES_SYNC_SCHEMA, POSTGRES_ROW_HASH_TABLE)
+        params = _lineage_params(lineage)
+        cursor.execute(
+            f"""SELECT
+                COUNT(*) FILTER (WHERE target.timestamp_m1 IS NULL),
+                COUNT(*) FILTER (
+                    WHERE target.timestamp_m1 IS NOT NULL
+                      AND target.row_sha256 IS DISTINCT FROM source.row_sha256
+                )
+            FROM {_SOURCE_STAGE_TABLE} AS source
+            LEFT JOIN {digest_table} AS target
+              ON target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+             AND target.timestamp_m1 = source.timestamp_m1""",
+            params,
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 2:
+            raise ValueError("PostgreSQL Gold staged-delta query returned an invalid row")
+        inserted, updated = _as_int(row[0], "staged insert count"), _as_int(row[1], "staged update count")
+        cursor.execute(
+            f"""SELECT COUNT(*) FROM {digest_table} AS target
+            WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
+                  WHERE source.timestamp_m1 = target.timestamp_m1
+              )""",
+            params,
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 1:
+            raise ValueError("PostgreSQL Gold staged-delete query returned an invalid row")
+        deleted = _as_int(row[0], "staged delete count")
+        return inserted, updated, deleted
+
+    def _verify_target_keys_and_checkpoint(
+        self,
+        cursor: CursorPort,
+        lineage: GoldLineage,
+        state: GoldSyncState | None,
+    ) -> None:
+        target_table = _qualified(POSTGRES_CONSUMER_SCHEMA, consumer_table_name(lineage.dataset_id))
+        digest_table = _qualified(POSTGRES_SYNC_SCHEMA, POSTGRES_ROW_HASH_TABLE)
+        expected = (
+            GoldTargetSummary(0, None, None)
+            if state is None
+            else GoldTargetSummary(state.row_count, state.min_timestamp, state.max_timestamp)
+        )
+        self._verify_summary(cursor, lineage, expected)
+        cursor.execute(
+            f"""SELECT
+                (SELECT COUNT(*) FROM {target_table} AS consumer
+                 LEFT JOIN {digest_table} AS digest
+                   ON digest.dataset_id = %s AND digest.exchange = consumer.exchange
+                  AND digest.symbol = consumer.symbol AND digest.timestamp_m1 = consumer.timestamp_m1
+                 WHERE consumer.exchange = %s AND consumer.symbol = %s
+                   AND digest.timestamp_m1 IS NULL)
+                +
+                (SELECT COUNT(*) FROM {digest_table} AS digest
+                 LEFT JOIN {target_table} AS consumer
+                   ON consumer.exchange = digest.exchange AND consumer.symbol = digest.symbol
+                  AND consumer.timestamp_m1 = digest.timestamp_m1
+                 WHERE digest.dataset_id = %s AND digest.exchange = %s AND digest.symbol = %s
+                   AND consumer.timestamp_m1 IS NULL)""",
+            (*_lineage_params(lineage), *_lineage_params(lineage)),
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 1 or _as_int(row[0], "target key mismatch count") != 0:
+            raise ValueError("PostgreSQL Gold consumer and digest keys are inconsistent")
+
+    @staticmethod
+    def _verify_unchanged_stage_rows(
+        cursor: CursorPort,
+        lineage: GoldLineage,
+        consumer_table: PostgresCatalogTable,
+    ) -> None:
+        target_table = _qualified(consumer_table.schema_name, consumer_table.table_name)
+        digest_table = _qualified(POSTGRES_SYNC_SCHEMA, POSTGRES_ROW_HASH_TABLE)
+        differences = " OR ".join(
+            f"consumer.{quote_identifier(column.name)} IS DISTINCT FROM source.{quote_identifier(column.name)}"
+            for column in consumer_table.columns
+        )
+        cursor.execute(
+            f"""SELECT COUNT(*) FROM {_SOURCE_STAGE_TABLE} AS source
+            JOIN {digest_table} AS digest
+              ON digest.dataset_id = %s AND digest.exchange = %s AND digest.symbol = %s
+             AND digest.timestamp_m1 = source.timestamp_m1
+            JOIN {target_table} AS consumer
+              ON consumer.exchange = source.exchange AND consumer.symbol = source.symbol
+             AND consumer.timestamp_m1 = source.timestamp_m1
+            WHERE digest.row_sha256 = source.row_sha256 AND ({differences})""",
+            _lineage_params(lineage),
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 1 or _as_int(row[0], "unchanged consumer mismatch count") != 0:
+            raise ValueError("PostgreSQL Gold unchanged consumer rows differ from their canonical source")
+
+    @staticmethod
+    def _verify_staged_consumer(
+        cursor: CursorPort,
+        lineage: GoldLineage,
+        consumer_table: PostgresCatalogTable,
+    ) -> None:
+        target_table = _qualified(consumer_table.schema_name, consumer_table.table_name)
+        differences = " OR ".join(
+            f"consumer.{quote_identifier(column.name)} IS DISTINCT FROM source.{quote_identifier(column.name)}"
+            for column in consumer_table.columns
+        )
+        cursor.execute(
+            f"""SELECT
+                (SELECT COUNT(*) FROM {_SOURCE_STAGE_TABLE} AS source
+                 LEFT JOIN {target_table} AS consumer
+                   ON consumer.exchange = source.exchange AND consumer.symbol = source.symbol
+                  AND consumer.timestamp_m1 = source.timestamp_m1
+                 WHERE consumer.timestamp_m1 IS NULL OR ({differences}))
+                +
+                (SELECT COUNT(*) FROM {target_table} AS consumer
+                 LEFT JOIN {_SOURCE_STAGE_TABLE} AS source
+                   ON source.exchange = consumer.exchange AND source.symbol = consumer.symbol
+                  AND source.timestamp_m1 = consumer.timestamp_m1
+                 WHERE consumer.exchange = %s AND consumer.symbol = %s
+                   AND source.timestamp_m1 IS NULL)""",
+            (lineage.exchange, lineage.symbol),
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 1 or _as_int(row[0], "staged consumer mismatch count") != 0:
+            raise ValueError("PostgreSQL Gold consumer table does not exactly match the staged source")
+
+    @staticmethod
+    def _apply_staged_delta(
+        cursor: CursorPort,
+        lineage: GoldLineage,
+        consumer_table: PostgresCatalogTable,
+        counts: tuple[int, int, int],
+    ) -> None:
+        inserted, updated, deleted = counts
+        target_table = _qualified(consumer_table.schema_name, consumer_table.table_name)
+        digest_table = _qualified(POSTGRES_SYNC_SCHEMA, POSTGRES_ROW_HASH_TABLE)
+        column_names = tuple(column.name for column in consumer_table.columns)
+        key_columns = ("exchange", "symbol", "timestamp_m1")
+        mutable_columns = tuple(name for name in column_names if name not in key_columns)
+        target_projection = ", ".join(quote_identifier(name) for name in column_names)
+
+        cursor.execute(
+            f"""INSERT INTO {target_table} ({target_projection})
+            SELECT {target_projection} FROM {_SOURCE_STAGE_TABLE} AS source
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {target_table} AS target
+                WHERE target.exchange = source.exchange AND target.symbol = source.symbol
+                  AND target.timestamp_m1 = source.timestamp_m1
+            )"""
+        )
+        if cursor.rowcount != inserted:
+            raise ValueError("PostgreSQL Gold staged insert count changed during reconciliation")
+
+        if updated:
+            if not mutable_columns:
+                raise ValueError("Gold update contains no mutable payload columns")
+            assignments = ", ".join(
+                f"{quote_identifier(name)} = source.{quote_identifier(name)}" for name in mutable_columns
+            )
+            cursor.execute(
+                f"""UPDATE {target_table} AS target SET {assignments}
+                FROM {_SOURCE_STAGE_TABLE} AS source
+                JOIN {digest_table} AS digest
+                  ON digest.dataset_id = %s AND digest.exchange = %s AND digest.symbol = %s
+                 AND digest.timestamp_m1 = source.timestamp_m1
+                WHERE target.exchange = source.exchange AND target.symbol = source.symbol
+                  AND target.timestamp_m1 = source.timestamp_m1
+                  AND digest.row_sha256 IS DISTINCT FROM source.row_sha256""",
+                _lineage_params(lineage),
+            )
+            if cursor.rowcount != updated:
+                raise ValueError("PostgreSQL Gold staged update count changed during reconciliation")
+
+        cursor.execute(
+            f"""DELETE FROM {target_table} AS target
+            WHERE target.exchange = %s AND target.symbol = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
+                  WHERE source.timestamp_m1 = target.timestamp_m1
+              )""",
+            (lineage.exchange, lineage.symbol),
+        )
+        if cursor.rowcount != deleted:
+            raise ValueError("PostgreSQL Gold staged consumer-delete count changed during reconciliation")
+
+        cursor.execute(
+            f"""DELETE FROM {digest_table} AS target
+            WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM {_SOURCE_STAGE_TABLE} AS source
+                  WHERE source.timestamp_m1 = target.timestamp_m1
+              )""",
+            _lineage_params(lineage),
+        )
+        if cursor.rowcount != deleted:
+            raise ValueError("PostgreSQL Gold staged digest-delete count changed during reconciliation")
+
+        cursor.execute(
+            f"""INSERT INTO {digest_table} (dataset_id, exchange, symbol, timestamp_m1, row_sha256)
+            SELECT %s, %s, %s, source.timestamp_m1, source.row_sha256
+            FROM {_SOURCE_STAGE_TABLE} AS source
+            ON CONFLICT (dataset_id, exchange, symbol, timestamp_m1) DO UPDATE
+            SET row_sha256 = EXCLUDED.row_sha256
+            WHERE {digest_table}.row_sha256 IS DISTINCT FROM EXCLUDED.row_sha256""",
+            _lineage_params(lineage),
+        )
+        if cursor.rowcount != inserted + updated:
+            raise ValueError("PostgreSQL Gold staged digest upsert count changed during reconciliation")
+
+    @staticmethod
+    def _verify_stage_digests(cursor: CursorPort, lineage: GoldLineage, expected_count: int) -> None:
+        digest_table = _qualified(POSTGRES_SYNC_SCHEMA, POSTGRES_ROW_HASH_TABLE)
+        cursor.execute(
+            f"""SELECT
+                (SELECT COUNT(*) FROM {_SOURCE_STAGE_TABLE} AS source
+                 LEFT JOIN {digest_table} AS target
+                   ON target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+                  AND target.timestamp_m1 = source.timestamp_m1
+                 WHERE target.timestamp_m1 IS NULL
+                    OR target.row_sha256 IS DISTINCT FROM source.row_sha256)
+                +
+                (SELECT COUNT(*) FROM {digest_table} AS target
+                 LEFT JOIN {_SOURCE_STAGE_TABLE} AS source
+                   ON source.timestamp_m1 = target.timestamp_m1
+                 WHERE target.dataset_id = %s AND target.exchange = %s AND target.symbol = %s
+                   AND source.timestamp_m1 IS NULL)""",
+            (*_lineage_params(lineage), *_lineage_params(lineage)),
+        )
+        row = cursor.fetchone()
+        if row is None or len(row) != 1 or _as_int(row[0], "staged digest mismatch count") != 0:
+            raise ValueError("PostgreSQL Gold digest table does not exactly match the staged source")
+        cursor.execute(f"SELECT COUNT(*) FROM {_SOURCE_STAGE_TABLE}")
+        row = cursor.fetchone()
+        if row is None or len(row) != 1 or _as_int(row[0], "staged source count") != expected_count:
+            raise ValueError("PostgreSQL Gold staged source count differs from the manifest snapshot")
+
+    def reconcile_lineage_stream(
+        self,
+        snapshot: GoldSourceSnapshot,
+        ddl: str,
+        schema_signature: str,
+        source_rows: Iterable[Mapping[str, object]],
+        next_state: GoldSyncState,
+    ) -> GoldSyncLineageResult:
+        """Stage a lineage in bounded batches, then reconcile it with set-based SQL atomically."""
+
+        table_ddl = _safe_table_ddl(ddl)
+        expected_tables = owned_catalog_tables(table_ddl)
+        lineage = snapshot.lineage
+        if next_state.lineage != lineage or next_state.schema_signature != schema_signature:
+            raise ValueError("Gold reconcile state does not match the requested lineage/schema")
+        consumer_name = consumer_table_name(lineage.dataset_id)
+        consumer_table = next(
+            (
+                table
+                for table in expected_tables
+                if table.schema_name == POSTGRES_CONSUMER_SCHEMA and table.table_name == consumer_name
+            ),
+            None,
+        )
+        if consumer_table is None:
+            raise ValueError("PostgreSQL Gold consumer table is absent from the canonical catalog")
+
+        connection = self._open()
+        stage = "advisory lock"
+        try:
+            cursor = connection.cursor()
+            try:
+                lock_key = f"{lineage.dataset_id}|{lineage.exchange}|{lineage.symbol}"
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+                stage = "catalog validation"
+                _verify_owned_catalog(cursor, expected_tables)
+                stage = "checkpoint read"
+                state = self._read_state(cursor, lineage)
+                if state is not None and state.schema_signature != schema_signature:
+                    raise PostgresSchemaMismatchError("PostgreSQL Gold schema migration required")
+
+                stage = "target key/checkpoint validation"
+                self._verify_target_keys_and_checkpoint(cursor, lineage, state)
+
+                stage = "temporary source staging"
+                target_table = _qualified(consumer_table.schema_name, consumer_table.table_name)
+                cursor.execute(
+                    f"CREATE TEMP TABLE {_SOURCE_STAGE_TABLE} (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP"
+                )
+                cursor.execute(f"ALTER TABLE {_SOURCE_STAGE_TABLE} ADD COLUMN row_sha256 CHAR(64) NOT NULL")
+                cursor.execute(f"CREATE UNIQUE INDEX ON {_SOURCE_STAGE_TABLE} (exchange, symbol, timestamp_m1)")
+                column_names = tuple(column.name for column in consumer_table.columns)
+                self._stage_source_rows(cursor, source_rows, column_names, expected_count=snapshot.row_count)
+
+                stage = "delta planning"
+                counts = self._stage_difference_counts(cursor, lineage)
+                inserted, updated, deleted = counts
+                if state is not None and state_matches_snapshot(state, snapshot):
+                    if counts != (0, 0, 0):
+                        raise ValueError("unchanged Gold checkpoint does not match canonical source row digests")
+                    self._verify_unchanged_stage_rows(cursor, lineage, consumer_table)
+                    self._verify_summary(cursor, lineage, expected_target_summary(snapshot))
+                    connection.commit()
+                    return GoldSyncLineageResult(
+                        lineage,
+                        snapshot.source_fingerprint,
+                        0,
+                        0,
+                        0,
+                        snapshot.row_count,
+                        "unchanged",
+                    )
+
+                stage = "unchanged-row integrity check"
+                self._verify_unchanged_stage_rows(cursor, lineage, consumer_table)
+
+                stage = "set-based delta writes"
+                self._apply_staged_delta(cursor, lineage, consumer_table, counts)
+                stage = "checkpoint write"
+                cursor.execute(_UPSERT_STATE, _state_params(next_state))
+                stage = "post-write verification"
+                self._verify_stage_digests(cursor, lineage, snapshot.row_count)
+                self._verify_staged_consumer(cursor, lineage, consumer_table)
+                verified_state = self._read_state(cursor, lineage)
+                if verified_state != next_state:
+                    raise ValueError("PostgreSQL Gold saved checkpoint does not match the reconcile decision")
+                self._verify_summary(cursor, lineage, expected_target_summary(snapshot))
+            finally:
+                cursor.close()
+            connection.commit()
+            return GoldSyncLineageResult(
+                lineage,
+                snapshot.source_fingerprint,
+                inserted,
+                updated,
+                deleted,
+                snapshot.row_count - inserted - updated,
+                "synchronized",
+            )
+        except PostgresSchemaMismatchError, ValueError, TypeError:
+            connection.rollback()
+            raise
+        except Exception as exc:
+            connection.rollback()
+            raise PostgresGoldRepositoryError(
+                "PostgreSQL Gold reconcile transaction failed",
+                safe_detail=f"{stage}: {_safe_database_error_code(exc, password=self._settings.password)}",
+            ) from None
+        finally:
+            connection.close()
+
     def reconcile_lineage(
         self,
         snapshot: GoldSourceSnapshot,
@@ -632,17 +1085,21 @@ class PostgresGoldSyncRepository:
         expected_tables = owned_catalog_tables(table_ddl)
         lineage = snapshot.lineage
         connection = self._open()
+        stage = "advisory lock"
         try:
             cursor = connection.cursor()
             try:
                 lock_key = f"{lineage.dataset_id}|{lineage.exchange}|{lineage.symbol}"
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+                stage = "catalog validation"
                 _verify_owned_catalog(cursor, expected_tables)
 
+                stage = "checkpoint read"
                 state = self._read_state(cursor, lineage)
                 if state is not None and state.schema_signature != schema_signature:
                     raise PostgresSchemaMismatchError("PostgreSQL Gold schema migration required")
-                digests = self._read_digests(cursor, lineage)
+                stage = "digest read"
+                digests = self._read_digests(connection, lineage)
                 consumer_name = consumer_table_name(lineage.dataset_id)
                 consumer_table = next(
                     (
@@ -654,19 +1111,24 @@ class PostgresGoldSyncRepository:
                 )
                 if consumer_table is None:
                     raise ValueError("PostgreSQL Gold consumer table is absent from the canonical catalog")
-                consumer_digests = self._read_consumer_digests(cursor, lineage, consumer_table)
+                stage = "consumer integrity read"
+                consumer_digests = self._iter_consumer_digests(connection, lineage, consumer_table)
                 self._verify_integrity(lineage, state, consumer_digests, digests)
+                stage = "reconcile planning"
                 decision = planner(state, digests)
 
                 if decision.plan is not None:
                     if decision.next_state is None or decision.next_state.lineage != lineage:
                         raise ValueError("Gold reconcile state lineage does not match requested lineage")
+                    stage = "delta writes"
                     self._apply_plan(cursor, lineage, decision.plan)
                 if decision.next_state is not None:
+                    stage = "checkpoint write"
                     cursor.execute(_UPSERT_STATE, _state_params(decision.next_state))
+                stage = "post-write verification"
                 verified_state = self._read_state(cursor, lineage)
-                verified_digests = self._read_digests(cursor, lineage)
-                verified_consumer = self._read_consumer_digests(cursor, lineage, consumer_table)
+                verified_digests = self._read_digests(connection, lineage)
+                verified_consumer = self._iter_consumer_digests(connection, lineage, consumer_table)
                 expected_source = decision.plan.source_digests if decision.plan is not None else digests
                 expected_state = decision.next_state if decision.next_state is not None else state
                 if verified_state != expected_state:
@@ -679,9 +1141,12 @@ class PostgresGoldSyncRepository:
         except PostgresSchemaMismatchError, ValueError, TypeError:
             connection.rollback()
             raise
-        except Exception:
+        except Exception as exc:
             connection.rollback()
-            raise PostgresGoldRepositoryError("PostgreSQL Gold reconcile transaction failed") from None
+            raise PostgresGoldRepositoryError(
+                "PostgreSQL Gold reconcile transaction failed",
+                safe_detail=f"{stage}: {_safe_database_error_code(exc, password=self._settings.password)}",
+            ) from None
         finally:
             connection.close()
 

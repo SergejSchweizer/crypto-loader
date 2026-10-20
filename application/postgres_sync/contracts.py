@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -292,6 +292,20 @@ class GoldSyncRepository(Protocol):
         schema_signature: str,
         planner: GoldReconcilePlanner,
     ) -> GoldReconcileDecision: ...
+
+
+@runtime_checkable
+class GoldStreamingSyncRepository(Protocol):
+    """Optional repository capability for bounded, database-staged reconciliation."""
+
+    def reconcile_lineage_stream(
+        self,
+        snapshot: GoldSourceSnapshot,
+        ddl: str,
+        schema_signature: str,
+        source_rows: Iterable[Mapping[str, object]],
+        next_state: GoldSyncState,
+    ) -> GoldSyncLineageResult: ...
 
 
 def state_matches_snapshot(state: GoldSyncState, snapshot: GoldSourceSnapshot) -> bool:
