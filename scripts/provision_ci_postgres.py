@@ -7,10 +7,7 @@ from typing import cast
 
 import polars as pl
 import psycopg
-from psycopg.conninfo import conninfo_to_dict
-
-from application.postgres_sync.schema import bootstrap_migration, build_postgres_table_schema
-from scripts.provision_postgres_sync_role import (
+from provision_postgres_sync_role import (
     APP_ROLE,
     CONSUMER_SCHEMA,
     SYNC_SCHEMA,
@@ -23,6 +20,9 @@ from scripts.provision_postgres_sync_role import (
     _migration_tables,
     _validate_runtime_contract,
 )
+from psycopg.conninfo import conninfo_to_dict
+
+from application.postgres_sync.schema import bootstrap_migration, build_postgres_table_schema
 
 
 def main() -> int:
